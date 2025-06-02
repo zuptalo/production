@@ -2,12 +2,17 @@
 
 # Automated Cron Job Setup Script
 # Sets up all automated maintenance and backup schedules
+# SAFE FOR MULTIPLE EXECUTIONS - Prevents duplicates
 
 set -euo pipefail
 
 LOG_FILE="/var/log/cron-setup.log"
 CRON_BACKUP_FILE="/tmp/current_crontab_backup_$(date +%Y%m%d_%H%M%S)"
 SCRIPT_DIR="/root/production/scripts"
+
+# Markers for identifying our additions
+CRON_MARKER="# === Docker Backup System - Auto-generated ==="
+BASHRC_MARKER="# === Docker Backup System aliases ==="
 
 # Function to log messages
 log_message() {
@@ -64,13 +69,15 @@ verify_script_paths() {
     done
 }
 
-# Function to create log rotation configuration
+# Function to create log rotation configuration (SAFE FOR MULTIPLE RUNS)
 setup_log_rotation() {
     log_message "Setting up log rotation..."
 
     local logrotate_config="/etc/logrotate.d/docker-backup-system"
+    local temp_config="/tmp/docker-backup-system.logrotate"
 
-    cat > "$logrotate_config" << 'EOF'
+    # Create the configuration content
+    cat > "$temp_config" << 'EOF'
 /var/log/backup-*.log /var/log/portainer-*.log /var/log/tailscale-*.log /var/log/nginx-*.log {
     daily
     rotate 30
@@ -86,29 +93,46 @@ setup_log_rotation() {
 }
 EOF
 
-    log_message "✓ Log rotation configured: $logrotate_config"
+    # Only update if different or doesn't exist
+    if [ ! -f "$logrotate_config" ] || ! cmp -s "$temp_config" "$logrotate_config"; then
+        mv "$temp_config" "$logrotate_config"
+        log_message "✓ Log rotation configured: $logrotate_config"
+    else
+        rm -f "$temp_config"
+        log_message "✓ Log rotation already up to date"
+    fi
 }
 
-# Function to create the new crontab
+# Function to create crontab (DUPLICATE-SAFE)
 create_crontab() {
     log_message "Creating optimized crontab configuration..."
 
     local temp_crontab
     temp_crontab="/tmp/new_crontab_$(date +%Y%m%d_%H%M%S)"
 
-    # Start with existing crontab (if any)
-    if [ -s "$CRON_BACKUP_FILE" ]; then
-        cp "$CRON_BACKUP_FILE" "$temp_crontab"
-        echo "" >> "$temp_crontab"
-        echo "# === Docker Backup System - Auto-generated ===" >> "$temp_crontab"
+    # Check if our cron jobs already exist
+    if crontab -l 2>/dev/null | grep -q "$CRON_MARKER"; then
+        log_message "Docker Backup System cron jobs already exist"
+        echo "✓ Cron jobs already configured"
+
+        # Remove existing entries and recreate (ensures updates work)
+        log_message "Updating existing cron jobs..."
+        crontab -l 2>/dev/null | sed "/$CRON_MARKER/,\$d" > "$temp_crontab"
     else
-        echo "# Docker Backup System - Automated Cron Jobs" > "$temp_crontab"
-        echo "# Generated on $(date)" >> "$temp_crontab"
-        echo "" >> "$temp_crontab"
+        # Start with existing crontab (if any)
+        if [ -s "$CRON_BACKUP_FILE" ]; then
+            cp "$CRON_BACKUP_FILE" "$temp_crontab"
+            echo "" >> "$temp_crontab"
+        else
+            echo "# Docker Backup System - Automated Cron Jobs" > "$temp_crontab"
+            echo "# Generated on $(date)" >> "$temp_crontab"
+            echo "" >> "$temp_crontab"
+        fi
     fi
 
-    # Add backup system cron jobs
+    # Add our marker and cron jobs
     cat >> "$temp_crontab" << EOF
+$CRON_MARKER
 # Daily backup and transfer (2:00 AM)
 0 2 * * * $SCRIPT_DIR/backup-full-cycle.sh >> /var/log/backup-cron.log 2>&1
 
@@ -131,7 +155,7 @@ EOF
 
     # Install the new crontab
     if crontab "$temp_crontab"; then
-        log_message "✓ New crontab installed successfully"
+        log_message "✓ Crontab updated successfully"
         rm -f "$temp_crontab"
     else
         log_message "✗ Failed to install new crontab"
@@ -140,13 +164,14 @@ EOF
     fi
 }
 
-# Function to create monitoring script
+# Function to create monitoring script (SAFE FOR MULTIPLE RUNS)
 create_monitoring_script() {
     log_message "Creating monitoring script..."
 
     local monitor_script="/root/production/scripts/check-backup-health.sh"
+    local temp_script="/tmp/check-backup-health.sh"
 
-    cat > "$monitor_script" << 'EOF'
+    cat > "$temp_script" << 'EOF'
 #!/bin/bash
 
 # Backup System Health Check Script
@@ -229,51 +254,152 @@ echo
 echo "========================================"
 EOF
 
-    chmod +x "$monitor_script"
-    log_message "✓ Health check script created: $monitor_script"
+    # Only update if different or doesn't exist
+    if [ ! -f "$monitor_script" ] || ! cmp -s "$temp_script" "$monitor_script"; then
+        mv "$temp_script" "$monitor_script"
+        chmod +x "$monitor_script"
+        log_message "✓ Health check script created/updated: $monitor_script"
+    else
+        rm -f "$temp_script"
+        log_message "✓ Health check script already up to date"
+    fi
 }
 
-# Function to create helpful aliases
+# Function to ensure .bashrc loads .bash_aliases (DUPLICATE-SAFE)
+ensure_bash_aliases_loaded() {
+    log_message "Ensuring .bash_aliases gets loaded by .bashrc..."
+
+    local bashrc_file="/root/.bashrc"
+
+    # Check if .bashrc exists, create if not
+    if [ ! -f "$bashrc_file" ]; then
+        log_message "Creating .bashrc file..."
+        cat > "$bashrc_file" << 'EOF'
+# .bashrc - Root user bash configuration
+
+# If not running interactively, don't do anything
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# Basic shell options
+shopt -s histappend
+shopt -s checkwinsize
+
+# History settings
+HISTCONTROL=ignoreboth
+HISTSIZE=1000
+HISTFILESIZE=2000
+
+# Enable color support
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+fi
+
+# Basic aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+EOF
+        log_message "✓ Created basic .bashrc file"
+    fi
+
+    # Check if our alias loader already exists
+    if grep -q "$BASHRC_MARKER" "$bashrc_file"; then
+        log_message "✓ .bashrc already loads .bash_aliases (our section exists)"
+    elif grep -q "bash_aliases" "$bashrc_file"; then
+        log_message "✓ .bashrc already loads .bash_aliases (different section exists)"
+    else
+        log_message "Adding .bash_aliases loader to .bashrc..."
+        cat >> "$bashrc_file" << EOF
+
+$BASHRC_MARKER
+if [ -f ~/.bash_aliases ]; then
+    . ~/.bash_aliases
+fi
+EOF
+        log_message "✓ .bashrc now loads .bash_aliases"
+    fi
+}
+
+# Function to create helpful aliases (SAFE FOR MULTIPLE RUNS)
 create_aliases() {
     log_message "Creating helpful aliases..."
 
     local alias_file="/root/.bash_aliases"
+    local temp_alias_file="/tmp/.bash_aliases"
 
-    # Backup existing aliases if they exist
-    if [ -f "$alias_file" ]; then
-        cp "$alias_file" "${alias_file}.backup.$(date +%Y%m%d_%H%M%S)"
-    fi
-
-    # Add backup system aliases
-    cat >> "$alias_file" << EOF
-
+    # Create the aliases content
+    cat > "$temp_alias_file" << EOF
 # === Docker Backup System Aliases ===
+# Generated by 05-setup-cron-jobs.sh on $(date)
+# Safe for multiple script executions
+
+# Backup Operations
 alias backup-now='$SCRIPT_DIR/backup-full-cycle.sh'
 alias backup-local='$SCRIPT_DIR/docker-backup.sh'
 alias backup-status='$SCRIPT_DIR/list-backups.sh'
 alias backup-restore='$SCRIPT_DIR/docker-restore.sh'
 alias backup-health='$SCRIPT_DIR/check-backup-health.sh'
+
+# Monitoring
 alias tailscale-status='$SCRIPT_DIR/tailscale-helper.sh status'
 alias tailscale-test='$SCRIPT_DIR/tailscale-helper.sh test'
-alias portainer-update='$SCRIPT_DIR/03-deploy-portainer.sh'
 alias logs-backup='tail -f /var/log/backup-*.log'
 alias logs-cron='tail -f /var/log/backup-cron.log'
 
+# Maintenance
+alias portainer-update='$SCRIPT_DIR/03-deploy-portainer.sh'
+alias disaster-recovery='$SCRIPT_DIR/disaster-recovery.sh'
+
+# Quick navigation
+alias production='cd /root/production'
+alias scripts='cd /root/production/scripts'
+alias logs='cd /var/log && ls -la backup-*.log portainer-*.log tailscale-*.log 2>/dev/null || echo "No log files found yet"'
+
+# System shortcuts
+alias backup-logs='cd /var/log && tail -f backup-*.log'
+alias health='$SCRIPT_DIR/check-backup-health.sh'
 EOF
 
-    log_message "✓ Aliases added to $alias_file"
-    echo "Tip: Run 'source ~/.bashrc' or start a new shell to use aliases"
+    # Backup existing aliases if they exist and are different
+    if [ -f "$alias_file" ]; then
+        if ! cmp -s "$temp_alias_file" "$alias_file"; then
+            cp "$alias_file" "${alias_file}.backup.$(date +%Y%m%d_%H%M%S)"
+            log_message "✓ Backed up existing aliases (content changed)"
+            mv "$temp_alias_file" "$alias_file"
+            log_message "✓ Updated aliases file"
+        else
+            rm -f "$temp_alias_file"
+            log_message "✓ Aliases file already up to date"
+        fi
+    else
+        mv "$temp_alias_file" "$alias_file"
+        log_message "✓ Created new aliases file"
+    fi
+
+    # Make sure the file has proper permissions
+    chmod 644 "$alias_file"
+
+    # Ensure .bashrc loads it
+    ensure_bash_aliases_loaded
 }
 
 # Function to test cron jobs
 test_cron_setup() {
     log_message "Testing cron job setup..."
 
-    echo "Installed cron jobs:"
-    crontab -l | grep -E "(backup|portainer|tailscale|docker)" || {
+    echo "Installed Docker Backup System cron jobs:"
+    if crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" | grep -E "(backup|portainer|tailscale|docker)"; then
+        local job_count=$(crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" | grep -E "(backup|portainer|tailscale|docker)" | wc -l)
+        echo "✓ Found $job_count backup system cron jobs"
+    else
         log_message "⚠ No backup system cron jobs found"
         return 1
-    }
+    fi
 
     # Test if scripts can be executed
     echo
@@ -292,57 +418,126 @@ test_cron_setup() {
     log_message "✓ Cron job setup test completed"
 }
 
-# Function to show next steps
+# Function to check if aliases are working
+check_aliases_working() {
+    echo
+    echo "🔍 Testing alias configuration..."
+
+    # Test if alias file exists and bashrc loads it
+    if [ -f "/root/.bash_aliases" ] && (grep -q "bash_aliases" "/root/.bashrc" || grep -q "$BASHRC_MARKER" "/root/.bashrc"); then
+        echo "✅ Alias configuration is properly set up"
+        echo "🎯 Run 'source ~/.bashrc' then try: backup-health"
+    else
+        echo "⚠️  Alias configuration issue detected"
+        echo "🔧 Check .bashrc and .bash_aliases files"
+    fi
+}
+
+# Function to show execution summary (NEW)
+show_execution_summary() {
+    echo
+    echo "========================================"
+    echo "  Script Execution Summary"
+    echo "========================================"
+    echo
+
+    # Check what was actually done vs skipped
+    local summary_items=()
+
+    # Check cron jobs
+    if crontab -l 2>/dev/null | grep -q "$CRON_MARKER"; then
+        summary_items+=("✓ Cron jobs: Configured/Updated")
+    else
+        summary_items+=("✗ Cron jobs: Failed to configure")
+    fi
+
+    # Check aliases
+    if [ -f "/root/.bash_aliases" ]; then
+        summary_items+=("✓ Aliases: Created/Updated")
+    else
+        summary_items+=("✗ Aliases: Failed to create")
+    fi
+
+    # Check bashrc
+    if grep -q "bash_aliases" "/root/.bashrc" 2>/dev/null; then
+        summary_items+=("✓ Bashrc: Loads aliases")
+    else
+        summary_items+=("✗ Bashrc: Does not load aliases")
+    fi
+
+    # Check health script
+    if [ -x "/root/production/scripts/check-backup-health.sh" ]; then
+        summary_items+=("✓ Health script: Available")
+    else
+        summary_items+=("✗ Health script: Missing")
+    fi
+
+    # Check log rotation
+    if [ -f "/etc/logrotate.d/docker-backup-system" ]; then
+        summary_items+=("✓ Log rotation: Configured")
+    else
+        summary_items+=("✗ Log rotation: Not configured")
+    fi
+
+    # Display summary
+    for item in "${summary_items[@]}"; do
+        echo "  $item"
+    done
+
+    echo
+    echo "🔄 This script is safe to run multiple times"
+    echo "📝 Check log: $LOG_FILE"
+}
+
+# Function to show next steps with better alias guidance
 show_next_steps() {
     echo
     echo "========================================"
-    echo "  Cron Jobs Setup Complete!"
+    echo "  Setup Complete!"
     echo "========================================"
     echo
-    echo "📅 Scheduled Jobs:"
-    echo "  • Daily backup:           2:00 AM (transfers to NAS)"
-    echo "  • Portainer updates:      3:00 AM (after backup)"
-    echo "  • Weekly connectivity:    Sunday 1:00 AM"
-    echo "  • Docker cleanup:         Sunday 4:00 AM"
-    echo "  • Log rotation:           Monthly"
-    echo "  • Daily health check:     6:00 AM"
+    echo "🚀 IMMEDIATE ACTION - Load New Aliases:"
+    echo "  Run this command now: source ~/.bashrc"
     echo
-    echo "📊 Monitoring:"
-    echo "  • Health check:     backup-health"
-    echo "  • Backup status:    backup-status"
-    echo "  • View logs:        logs-backup"
-    echo "  • Cron logs:        logs-cron"
+    echo "✅ Available Commands (after loading aliases):"
+    echo "  • backup-health     - System health check"
+    echo "  • backup-now        - Run immediate backup"
+    echo "  • backup-status     - List local and remote backups"
+    echo "  • backup-restore    - Interactive restore from backup"
+    echo "  • tailscale-test    - Test connectivity to NAS"
+    echo "  • logs-backup       - View backup logs"
+    echo "  • logs-cron         - View cron execution logs"
+    echo "  • portainer-update  - Update Portainer manually"
+    echo "  • disaster-recovery - Complete system restoration"
     echo
-    echo "🔧 Management Commands:"
-    echo "  • Manual backup:    backup-now"
-    echo "  • Restore data:     backup-restore"
-    echo "  • Test Tailscale:   tailscale-test"
-    echo "  • Update Portainer: portainer-update"
+    echo "📅 Automated Schedule:"
+    echo "  • Daily 2:00 AM     - Full backup + NAS transfer"
+    echo "  • Daily 3:00 AM     - Portainer updates"
+    echo "  • Daily 6:00 AM     - Health checks"
+    echo "  • Sunday 1:00 AM    - Connectivity tests"
+    echo "  • Sunday 4:00 AM    - Docker cleanup"
+    echo "  • Monthly           - Log rotation"
     echo
-    echo "📝 Log Files:"
-    echo "  • Backup operations:    /var/log/backup-*.log"
-    echo "  • Cron execution:       /var/log/backup-cron.log"
-    echo "  • Portainer updates:    /var/log/portainer-cron.log"
-    echo "  • Connectivity tests:   /var/log/tailscale-test.log"
-    echo "  • Health checks:        /var/log/daily-health-check.log"
+    echo "🎯 Quick Test Sequence:"
+    echo "  1. source ~/.bashrc"
+    echo "  2. backup-health"
+    echo "  3. backup-status"
     echo
-    echo "⚠️  Important Notes:"
-    echo "  • First backup will run tonight at 2:00 AM"
-    echo "  • Test manual backup first: backup-now"
-    echo "  • Monitor logs for the first few days"
-    echo "  • Crontab backup saved to: $CRON_BACKUP_FILE"
-    echo
-    echo "🚀 Your backup system is now fully automated!"
+    echo "⚠️  Important:"
+    echo "  • First backup runs tonight at 2:00 AM"
+    echo "  • Test manually first: backup-now"
+    echo "  • This script is safe to run multiple times"
     echo
 }
 
-# Function to create final verification
+# Function to create final verification (ENHANCED)
 create_verification_report() {
     local report_file="/root/backup-system-verification.txt"
 
     cat > "$report_file" << EOF
 Docker Backup System - Setup Verification Report
 Generated: $(date)
+Script Executions: Safe for multiple runs
 ===============================================
 
 ✅ COMPLETED SETUP STEPS:
@@ -355,17 +550,21 @@ Generated: $(date)
 📋 VERIFICATION CHECKLIST:
 
 SCHEDULED JOBS:
-$(crontab -l | grep -E "(backup|portainer|tailscale|docker)" | wc -l) cron jobs installed
+$(crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" 2>/dev/null | grep -E "(backup|portainer|tailscale|docker)" | wc -l) Docker Backup System cron jobs installed
 
 SCRIPT PERMISSIONS:
-$(find $SCRIPT_DIR -name "*.sh" -executable | wc -l) executable scripts found
+$(find $SCRIPT_DIR -name "*.sh" -executable 2>/dev/null | wc -l) executable scripts found
 
-LOG DIRECTORIES:
-$(ls -1d /var/log/backup*.log /var/log/portainer*.log 2>/dev/null | wc -l) log files initialized
+ALIASES CONFIGURATION:
+$(if [ -f "/root/.bash_aliases" ]; then echo "✓ Created"; else echo "✗ Missing"; fi) - Bash aliases file
+$(if grep -q "bash_aliases" "/root/.bashrc" 2>/dev/null; then echo "✓ Loaded"; else echo "✗ Not loaded"; fi) - Bashrc loads aliases
+
+LOG ROTATION:
+$(if [ -f "/etc/logrotate.d/docker-backup-system" ]; then echo "✓ Configured"; else echo "✗ Missing"; fi) - Log rotation config
 
 DOCKER STATUS:
-$(docker ps | grep -c "Up" || echo "0") containers running
-$(docker network ls | grep -c "prod-network" || echo "0") prod-network exists
+$(docker ps 2>/dev/null | grep -c "Up" || echo "0") containers running
+$(docker network ls 2>/dev/null | grep -c "prod-network" || echo "0") prod-network exists
 
 TAILSCALE STATUS:
 $(if tailscale status >/dev/null 2>&1; then echo "Connected"; else echo "Disconnected"; fi)
@@ -375,30 +574,31 @@ $(if [ -f "/root/.backup-config" ]; then echo "Configured"; else echo "Not confi
 
 🎯 NEXT ACTIONS REQUIRED:
 
-1. Test the backup system:
-   sudo backup-now
+1. Load aliases immediately:
+   source ~/.bashrc
 
-2. Verify backup creation:
+2. Test the backup system:
+   backup-now
+
+3. Verify backup creation:
    backup-status
 
-3. Check system health:
+4. Check system health:
    backup-health
 
-4. Monitor first automated backup (tonight at 2:00 AM):
-   tail -f /var/log/backup-cron.log
-
-5. Configure Nginx Proxy Manager:
-   - Access: http://$(hostname -I | awk '{print $1}'):81
-   - Login: admin@example.com / changeme
-   - Set up SSL certificates
-   - Create proxy hosts for services
+🔄 MAINTENANCE NOTES:
+- This setup script is safe to run multiple times
+- Re-running will update configurations without creating duplicates
+- Existing cron jobs will be replaced with current versions
+- Alias files are backed up before updates
 
 📞 SUPPORT:
-- Check logs: logs-backup
-- Health status: backup-health
-- Troubleshoot connectivity: tailscale-test
+- Check logs: logs-backup (after loading aliases)
+- Health status: backup-health (after loading aliases)
+- Troubleshoot connectivity: tailscale-test (after loading aliases)
 - View this report: cat $report_file
 
+Last updated: $(date)
 EOF
 
     echo "📋 Setup verification report created: $report_file"
@@ -409,10 +609,13 @@ EOF
 main() {
     echo "========================================"
     echo "  Automated Cron Jobs Setup"
+    echo "  (Safe for Multiple Executions)"
     echo "========================================"
     echo
 
-    log_message "=== Starting Cron Jobs Setup ==="
+    log_message "=== Starting Cron Jobs Setup ($(date)) ==="
+    log_message "Script executed from: $(pwd)"
+    log_message "Executed by: $(whoami)"
 
     # Check if running as root
     if [ "$EUID" -ne 0 ]; then
@@ -432,17 +635,23 @@ main() {
     # Setup log rotation
     setup_log_rotation
 
-    # Create new crontab
+    # Create new crontab (duplicate-safe)
     create_crontab
 
     # Create monitoring script
     create_monitoring_script
 
-    # Create helpful aliases
+    # Create helpful aliases (duplicate-safe)
     create_aliases
 
     # Test cron setup
     test_cron_setup
+
+    # Check if aliases are working
+    check_aliases_working
+
+    # Show what was actually done
+    show_execution_summary
 
     # Create verification report
     create_verification_report
@@ -456,6 +665,7 @@ main() {
 # Show help if requested
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "Automated Cron Jobs Setup Script"
+    echo "SAFE FOR MULTIPLE EXECUTIONS - Prevents duplicates"
     echo
     echo "This script sets up all automated maintenance and backup schedules."
     echo
@@ -463,12 +673,19 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo
     echo "What it does:"
     echo "- Backs up existing crontab"
-    echo "- Creates automated backup schedule (daily 2:00 AM)"
+    echo "- Creates/updates automated backup schedule (daily 2:00 AM)"
     echo "- Sets up Portainer auto-updates (daily 3:00 AM)"
     echo "- Configures weekly maintenance tasks"
     echo "- Sets up log rotation and monitoring"
     echo "- Creates helpful command aliases"
+    echo "- Ensures aliases are properly loaded"
     echo "- Provides verification report"
+    echo
+    echo "Duplicate Protection:"
+    echo "- Uses markers to identify existing configurations"
+    echo "- Safely updates existing cron jobs without duplication"
+    echo "- Backs up files before making changes"
+    echo "- Checks for existing configurations before adding"
     echo
     echo "Schedule Overview:"
     echo "  Daily 2:00 AM  - Full backup cycle"
@@ -477,6 +694,8 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "  Sunday 1:00 AM - Connectivity test"
     echo "  Sunday 4:00 AM - Docker cleanup"
     echo "  Monthly        - Log rotation"
+    echo
+    echo "After running: source ~/.bashrc"
     exit 0
 fi
 
