@@ -1,0 +1,9 @@
+.idea
+production.iml
+.env
+.backup-config
+*.log
+backup/
+.ssh/
+portainer/
+tools/
