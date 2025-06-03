@@ -81,8 +81,8 @@ jobs:
       - name: Wait for deployment to stabilize
         if: steps.deploy.outputs.deployment_success == 'true'
         run: |
-          echo "⏳ Waiting 30 seconds for deployment to stabilize..."
-          sleep 30
+          echo "⏳ Waiting 10 seconds for deployment to stabilize..."
+          sleep 10
 
       - name: Verify deployment
         if: steps.deploy.outputs.deployment_success == 'true'
