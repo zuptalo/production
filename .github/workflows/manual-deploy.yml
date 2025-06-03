@@ -126,8 +126,8 @@ jobs:
         run: |
           echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Trigger**: Manual workflow dispatch" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image Tag**: \`nginx:${{ steps.vars.outputs.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Timestamp**: ${{ steps.vars.outputs.TIMESTAMP }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Stack ID**: ${{ secrets.STACK_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: nginx web server" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: ${{ steps.vars.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(TZ='Europe/Stockholm' date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
           echo "- **Status**: ${{ steps.deploy.outputs.deployment_success == 'true' && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Force Pull**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
