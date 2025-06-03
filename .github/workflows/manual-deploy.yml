@@ -26,7 +26,7 @@ jobs:
         id: vars
         run: |
           echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
-          echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+          echo "TIMESTAMP=$(TZ='Europe/Stockholm' date '+%Y-%m-%d %H:%M:%S CET/CEST')" >> $GITHUB_OUTPUT
 
       - name: Update compose file with new image tag
         id: update_compose
