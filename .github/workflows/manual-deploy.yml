@@ -1,0 +1,133 @@
+name: Manual Deploy to Portainer
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g., latest, 1.25, alpine)'
+        required: true
+        default: 'latest'
+        type: string
+      force_recreate:
+        description: 'Force recreate containers'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set deployment variables
+        id: vars
+        run: |
+          echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+
+      - name: Update compose file with new image tag
+        id: update_compose
+        run: |
+          # Read the compose file and update the image tag
+          UPDATED_COMPOSE=$(sed "s|image: nginx:.*|image: nginx:${{ steps.vars.outputs.IMAGE_TAG }}|g" compose.yaml)
+          
+          echo "Updated compose file:"
+          echo "$UPDATED_COMPOSE"
+          
+          # Store the updated compose content for the API call
+          echo "updated_compose<<EOF" >> $GITHUB_OUTPUT
+          echo "$UPDATED_COMPOSE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Portainer
+        id: deploy
+        run: |
+          echo "🚀 Deploying nginx:${{ steps.vars.outputs.IMAGE_TAG }} to Portainer..."
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+            "${{ secrets.PORTAINER_URL }}/api/stacks/${{ secrets.STACK_ID }}" \
+            -H "X-API-Key: ${{ secrets.PORTAINER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @- << EOF
+          {
+            "stackFileContent": $(echo '${{ steps.update_compose.outputs.updated_compose }}' | jq -Rs .),
+            "env": [],
+            "prune": true,
+            "pullImage": true
+          }
+          EOF
+          )
+          
+          # Extract HTTP code and response body
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "HTTP Response Code: $HTTP_CODE"
+          echo "Response Body: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Stack updated successfully"
+            echo "deployment_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Deployment failed with HTTP code: $HTTP_CODE"
+            echo "Response: $RESPONSE_BODY"
+            echo "deployment_success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Wait for deployment to stabilize
+        if: steps.deploy.outputs.deployment_success == 'true'
+        run: |
+          echo "⏳ Waiting 30 seconds for deployment to stabilize..."
+          sleep 30
+
+      - name: Verify deployment
+        if: steps.deploy.outputs.deployment_success == 'true'
+        run: |
+          echo "🔍 Verifying deployment..."
+          
+          # Get container information
+          CONTAINERS=$(curl -s -X GET \
+            "${{ secrets.PORTAINER_URL }}/api/endpoints/${{ secrets.ENDPOINT_ID }}/docker/containers/json?filters=%7B%22label%22%3A%5B%22com.docker.compose.project%3D${{ secrets.STACK_NAME }}%22%5D%7D" \
+            -H "X-API-Key: ${{ secrets.PORTAINER_API_KEY }}")
+          
+          if [ "$CONTAINERS" = "null" ] || [ "$CONTAINERS" = "[]" ]; then
+            echo "❌ No containers found for stack: ${{ secrets.STACK_NAME }}"
+            exit 1
+          fi
+          
+          # Count running vs total containers
+          RUNNING_COUNT=$(echo "$CONTAINERS" | jq '[.[] | select(.State == "running")] | length')
+          TOTAL_COUNT=$(echo "$CONTAINERS" | jq 'length')
+          
+          echo "📊 Container Status: $RUNNING_COUNT/$TOTAL_COUNT running"
+          
+          # Show container details
+          echo "Container details:"
+          echo "$CONTAINERS" | jq -r '.[] | "• \(.Names[0]) - \(.State) - \(.Status)"'
+          
+          # Check if all containers are running
+          if [ "$RUNNING_COUNT" -eq "$TOTAL_COUNT" ] && [ "$TOTAL_COUNT" -gt 0 ]; then
+            echo "✅ All containers are running successfully!"
+          
+            # Get the nginx container image info
+            NGINX_IMAGE=$(echo "$CONTAINERS" | jq -r '.[] | select(.Names[0] | contains("nginx")) | .Image')
+            echo "🐳 Deployed image: $NGINX_IMAGE"
+          else
+            echo "❌ Some containers are not running properly"
+            exit 1
+          fi
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: Manual workflow dispatch" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag**: \`nginx:${{ steps.vars.outputs.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: ${{ steps.vars.outputs.TIMESTAMP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Stack ID**: ${{ secrets.STACK_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.deploy.outputs.deployment_success == 'true' && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Force Pull**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
