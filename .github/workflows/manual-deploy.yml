@@ -124,14 +124,15 @@ jobs:
       - name: Deployment Summary
         if: always()
         run: |
-          # Create a timestamp that avoids GitHub masking
-          DEPLOY_DATE=$(date '+%A, %B %d at %H:%M')
-          DEPLOY_YEAR=$(date '+%Y')
+          # Create a timestamp that completely avoids GitHub masking
+          DEPLOY_TIME=$(date '+%H:%M')
+          DEPLOY_DAY=$(date '+%A')
+          DEPLOY_MONTH=$(date '+%B')
           
           echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Trigger**: Manual workflow dispatch" >> $GITHUB_STEP_SUMMARY
           echo "- **Service**: Web server container" >> $GITHUB_STEP_SUMMARY
           echo "- **Version**: ${{ steps.vars.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **When**: $DEPLOY_DATE, $DEPLOY_YEAR (Stockholm time)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed**: $DEPLOY_DAY in $DEPLOY_MONTH at $DEPLOY_TIME Stockholm time" >> $GITHUB_STEP_SUMMARY
           echo "- **Result**: ${{ steps.deploy.outputs.deployment_success == 'true' && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Force Pull**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "- **Options**: Force pull enabled" >> $GITHUB_STEP_SUMMARY
