@@ -127,6 +127,48 @@ EOF
     log_message "✓ Metadata created: backup_metadata.json"
 }
 
+create_ownership_metadata() {
+    local backup_dir="$1"
+    local metadata_file="${backup_dir}/ownership_metadata.txt"
+
+    log_message "Creating ownership metadata for future restoration..."
+
+    # Create comprehensive ownership record
+    {
+        echo "# Ownership Metadata - $(date -Iseconds)"
+        echo "# Format: PATH:UID:GID:PERMISSIONS"
+
+        for source_dir in "/root/portainer" "/root/tools"; do
+            if [ -d "$source_dir" ]; then
+                echo "# Source: $source_dir"
+                find "$source_dir" -printf "%p:%U:%G:%m\n" 2>/dev/null
+            fi
+        done
+    } > "$metadata_file"
+
+    # Create restoration script
+    cat > "${backup_dir}/restore_ownership.sh" << 'RESTORE_SCRIPT'
+#!/bin/bash
+# Auto-generated ownership restoration
+METADATA_FILE="$(dirname "${BASH_SOURCE[0]}")/ownership_metadata.txt"
+[ ! -f "$METADATA_FILE" ] && exit 1
+
+echo "Restoring ownership from backup metadata..."
+while IFS=':' read -r path uid gid perms; do
+    [[ "$path" =~ ^#.*$ ]] && continue
+    [ -z "$path" ] && continue
+    [ -e "$path" ] || continue
+
+    chown "$uid:$gid" "$path" 2>/dev/null
+    chmod "$perms" "$path" 2>/dev/null
+done < "$METADATA_FILE"
+echo "✓ Ownership restoration completed"
+RESTORE_SCRIPT
+
+    chmod +x "${backup_dir}/restore_ownership.sh"
+    log_message "✓ Ownership metadata and restoration script created"
+}
+
 # Function to cleanup old backups (keep last N backups)
 cleanup_old_backups() {
     local keep_count=3
@@ -212,13 +254,16 @@ main() {
     # Step 5: Create metadata
     create_backup_metadata
 
-    # Step 6: Restart containers
+    # Step 6: Create ownership metadata
+    create_ownership_metadata "$BACKUP_DIR"
+
+    # Step 7: Restart containers
     start_containers
 
-    # Step 7: Cleanup old backups
+    # Step 8: Cleanup old backups
     cleanup_old_backups
 
-    # Step 8: Final summary
+    # Step 9: Final summary
     local total_size=$(du -sh "$BACKUP_DIR" | cut -f1)
     log_message "=== Backup Completed Successfully ==="
     log_message "Backup location: $BACKUP_DIR"

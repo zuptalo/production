@@ -346,7 +346,12 @@ restore_from_backup() {
     local portainer_archive
     portainer_archive=$(ls "$backup_dir"/portainer_*.tar.gz 2>/dev/null | head -1)
     if [ -n "$portainer_archive" ]; then
-        tar -xzf "$portainer_archive" -C "/root" 2>&1 | tee -a "$LOG_FILE"
+        tar -xzf "$portainer_archive" \
+            -C "/root" \
+            --same-owner \
+            --numeric-owner \
+            --preserve-permissions \
+            2>&1 | tee -a "$LOG_FILE"
         log_message "✓ Portainer restored"
         echo "✓ Portainer extracted"
     else
@@ -358,7 +363,12 @@ restore_from_backup() {
     local tools_archive
     tools_archive=$(ls "$backup_dir"/tools_*.tar.gz 2>/dev/null | head -1)
     if [ -n "$tools_archive" ]; then
-        tar -xzf "$tools_archive" -C "/root" 2>&1 | tee -a "$LOG_FILE"
+        tar -xzf "$tools_archive" \
+            -C "/root" \
+            --same-owner \
+            --numeric-owner \
+            --preserve-permissions \
+            2>&1 | tee -a "$LOG_FILE"
         log_message "✓ Tools restored"
         echo "✓ Tools extracted"
     else
@@ -371,6 +381,28 @@ restore_from_backup() {
 
     log_message "✓ Restore completed successfully"
     echo "✓ Restore completed"
+}
+
+# Function to restore ownerships from backup
+restore_ownership_from_metadata() {
+    local backup_dir="$1"
+    local restore_script="${backup_dir}/restore_ownership.sh"
+
+    if [ -f "$restore_script" ] && [ -x "$restore_script" ]; then
+        echo "Applying ownership restoration from backup metadata..."
+        log_message "Executing generic ownership restoration"
+
+        if "$restore_script"; then
+            echo "✓ Ownership restored from backup metadata"
+            log_message "✓ Ownership restoration successful"
+        else
+            echo "⚠ Ownership restoration had issues"
+            log_message "⚠ Ownership restoration script failed"
+        fi
+    else
+        echo "No ownership restoration data available in this backup"
+        log_message "No ownership restoration script found"
+    fi
 }
 
 # Function to cleanup temporary files
@@ -541,6 +573,9 @@ main() {
 
     # Perform restore
     restore_from_backup "$backup_dir"
+
+    # Perform ownership restore from metadata backup
+    restore_ownership_from_metadata "$backup_dir"
 
     # Restart containers
     start_containers
