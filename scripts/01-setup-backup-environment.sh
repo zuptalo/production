@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Setup script for backup environment on a fresh machine
-# Run this once after installing Docker and before running other scripts
+# Setup script for S3-based backup environment on a fresh machine
+# This version removes Tailscale dependency and focuses on S3 storage
 
 set -euo pipefail
 
@@ -29,11 +29,11 @@ create_directory() {
 }
 
 echo "========================================"
-echo "  Backup Environment Setup"
+echo "  S3 Backup Environment Setup"
 echo "========================================"
 echo
 
-log_message "=== Starting Backup Environment Setup ==="
+log_message "=== Starting S3 Backup Environment Setup ==="
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -50,131 +50,27 @@ fi
 log_message "✓ Running as root"
 log_message "✓ Docker is available"
 
-# Check if python3 is installed (needed for NAS discovery)
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "⚠ Warning: python3 not installed (needed for NAS discovery)"
-    echo "Install with: apt update && apt install -y python3"
-    log_message "⚠ python3 not installed"
+# Check if curl is installed (needed for S3 API calls)
+if ! command -v curl >/dev/null 2>&1; then
+    echo "⚠ Warning: curl not installed (needed for S3 uploads)"
+    echo "Install with: apt update && apt install -y curl"
+    log_message "⚠ curl not installed"
 else
-    echo "✓ python3 is available"
-    log_message "✓ python3 is available"
+    echo "✓ curl is available"
+    log_message "✓ curl is available"
 fi
 
-# Function to install Tailscale
-install_tailscale() {
-    echo
-    echo "Installing Tailscale..."
-    log_message "Installing Tailscale"
-
-    if command -v tailscale >/dev/null 2>&1; then
-        echo "✓ Tailscale is already installed"
-        log_message "✓ Tailscale already installed"
-        return 0
-    fi
-
-    # Download and install Tailscale
-    curl -fsSL https://tailscale.com/install.sh | sh
-
-    if command -v tailscale >/dev/null 2>&1; then
-        echo "✓ Tailscale installed successfully"
-        log_message "✓ Tailscale installed successfully"
-        return 0
-    else
-        echo "✗ Tailscale installation failed"
-        log_message "✗ Tailscale installation failed"
-        return 1
-    fi
-}
-
-# Function to configure Tailscale
-configure_tailscale() {
-    echo
-    echo "Configuring Tailscale..."
-    log_message "Configuring Tailscale"
-
-    # Check if already connected
-    if tailscale status >/dev/null 2>&1; then
-        echo "✓ Tailscale is already connected"
-        log_message "✓ Tailscale already connected"
-        tailscale status
-        return 0
-    fi
-
-    echo
-    echo "Tailscale needs to be authenticated with your account."
-    echo "You have several options:"
-    echo
-    echo "1. Manual authentication (recommended for first setup)"
-    echo "2. Use auth key (if you have one)"
-    echo "3. Skip Tailscale setup for now"
-    echo
-    read -p "Enter choice (1-3): " tailscale_choice
-
-    case $tailscale_choice in
-        1)
-            echo
-            echo "Starting Tailscale with manual authentication..."
-            echo "A browser window should open for authentication."
-            echo "If running on a headless server, copy the URL to a browser."
-            echo
-            tailscale up --ssh
-
-            if tailscale status >/dev/null 2>&1; then
-                echo "✓ Tailscale connected successfully"
-                log_message "✓ Tailscale connected successfully"
-                echo
-                echo "Current Tailscale status:"
-                tailscale status
-            else
-                echo "✗ Tailscale connection failed"
-                log_message "✗ Tailscale connection failed"
-                return 1
-            fi
-            ;;
-        2)
-            echo
-            read -p "Enter your Tailscale auth key: " auth_key
-            if [ -n "$auth_key" ]; then
-                tailscale up --authkey="$auth_key" --ssh
-
-                if tailscale status >/dev/null 2>&1; then
-                    echo "✓ Tailscale connected with auth key"
-                    log_message "✓ Tailscale connected with auth key"
-                    echo
-                    echo "Current Tailscale status:"
-                    tailscale status
-                else
-                    echo "✗ Tailscale connection with auth key failed"
-                    log_message "✗ Tailscale connection with auth key failed"
-                    return 1
-                fi
-            else
-                echo "✗ No auth key provided"
-                return 1
-            fi
-            ;;
-        3)
-            echo "⚠ Skipping Tailscale setup"
-            log_message "⚠ Tailscale setup skipped by user"
-            echo "You can set it up later with: tailscale up --ssh"
-            return 0
-            ;;
-        *)
-            echo "✗ Invalid choice"
-            return 1
-            ;;
-    esac
-}
+# Check if openssl is installed (needed for S3 signatures)
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "⚠ Warning: openssl not installed (needed for S3 authentication)"
+    echo "Install with: apt update && apt install -y openssl"
+    log_message "⚠ openssl not installed"
+else
+    echo "✓ openssl is available"
+    log_message "✓ openssl is available"
+fi
 
 echo "Creating required directories..."
-
-# Install and configure Tailscale first
-if ! install_tailscale; then
-    echo "✗ Tailscale installation failed. Continuing with setup..."
-    log_message "✗ Tailscale installation failed"
-else
-    configure_tailscale
-fi
 
 # Create main backup directories
 create_directory "/root/backup" "755" "root:root"
@@ -182,65 +78,11 @@ create_directory "/root/portainer" "755" "root:root"
 create_directory "/root/portainer/data" "755" "root:root"
 create_directory "/root/tools" "755" "root:root"
 
-# Create SSH directory with proper permissions
-create_directory "/root/.ssh" "700" "root:root"
-
 # Create log directory (usually exists but just in case)
 create_directory "/var/log" "755" "root:root"
 
 # Create temporary directories that might be needed
 create_directory "/tmp" "1777" "root:root"
-
-echo
-echo "Setting up SSH configuration..."
-
-# Check if SSH key exists
-if [ ! -f "/root/.ssh/backup_key" ]; then
-    echo "⚠ SSH backup key not found at /root/.ssh/backup_key"
-    echo "You need to:"
-    echo "1. Generate SSH key: ssh-keygen -t rsa -b 4096 -f /root/.ssh/backup_key -N ''"
-    echo "2. Copy public key to NAS: ssh-copy-id -i /root/.ssh/backup_key.pub backup-user@YOUR_NAS_IP"
-    echo "3. Test connection: ssh -i /root/.ssh/backup_key backup-user@YOUR_NAS_IP"
-    echo
-    echo "Would you like to generate the SSH key now? (y/n)"
-    read -p "Generate SSH key: " generate_key
-
-    if [ "$generate_key" = "y" ] || [ "$generate_key" = "Y" ]; then
-        echo "Generating SSH key..."
-        ssh-keygen -t rsa -b 4096 -f /root/.ssh/backup_key -N '' -C "backup-key-$(hostname)"
-
-        if [ -f "/root/.ssh/backup_key" ]; then
-            echo "✓ SSH key generated successfully"
-            log_message "✓ SSH key generated"
-
-            echo
-            echo "Public key content (copy this to your NAS):"
-            echo "================================================"
-            cat /root/.ssh/backup_key.pub
-            echo "================================================"
-            echo
-            echo "To add this to your NAS:"
-            echo "1. Access your NAS admin panel"
-            echo "2. Enable SSH service"
-            echo "3. Create a backup user account"
-            echo "4. Add the public key to the user's authorized_keys"
-            echo "5. Or use: ssh-copy-id -i /root/.ssh/backup_key.pub backup-user@YOUR_NAS_IP"
-        else
-            echo "✗ SSH key generation failed"
-            log_message "✗ SSH key generation failed"
-        fi
-    fi
-    log_message "⚠ SSH backup key not found"
-else
-    # Set proper permissions on SSH key
-    chmod 600 "/root/.ssh/backup_key"
-    chmod 644 "/root/.ssh/backup_key.pub" 2>/dev/null || true
-    log_message "✓ SSH key permissions set"
-    echo "✓ SSH key found and permissions set"
-
-    # Note: We'll test SSH connection in the discovery script
-    echo "✓ SSH key ready for NAS configuration"
-fi
 
 echo
 echo "Setting up Docker network..."
@@ -266,13 +108,13 @@ fi
 
 SCRIPTS=(
     "docker-backup.sh"
-    "transfer-backup-to-nas.sh"
+    "transfer-backup-to-s3.sh"
     "backup-full-cycle.sh"
-    "docker-restore.sh"
-    "list-backups.sh"
+    "docker-restore-s3.sh"
+    "list-backups-s3.sh"
     "03-deploy-portainer.sh"
-    "tailscale-helper.sh"
-    "02-tailscale-discovery.sh"
+    "s3-backup-config.sh"
+    "s3-helper.sh"
 )
 
 for script in "${SCRIPTS[@]}"; do
@@ -291,7 +133,7 @@ echo "Creating example cron jobs file..."
 
 # Create example crontab entries
 cat > "/root/example-crontab.txt" << 'EOF'
-# Example crontab entries for backup system
+# Example crontab entries for S3 backup system
 # Add these to your crontab with: crontab -e
 
 # Daily backup at 2 AM
@@ -300,8 +142,8 @@ cat > "/root/example-crontab.txt" << 'EOF'
 # Portainer updates daily at 3 AM (after backup)
 0 3 * * * /root/production/scripts/03-deploy-portainer.sh >> /var/log/portainer-cron.log 2>&1
 
-# Weekly connectivity test (Sundays at 1 AM)
-0 1 * * 0 /root/production/scripts/tailscale-helper.sh test >> /var/log/tailscale-test.log 2>&1
+# Weekly S3 connectivity test (Sundays at 1 AM)
+0 1 * * 0 /root/production/scripts/s3-helper.sh test >> /var/log/s3-test.log 2>&1
 
 # Weekly cleanup at 4 AM on Sundays
 0 4 * * 0 /usr/bin/docker system prune -f >> /var/log/docker-cleanup.log 2>&1
@@ -325,16 +167,6 @@ else
     log_message "✓ Sufficient disk space: ${AVAILABLE_GB}GB available"
 fi
 
-# Check if rsync is installed (needed for transfers)
-if ! command -v rsync >/dev/null 2>&1; then
-    echo "⚠ Warning: rsync not installed (needed for backup transfers)"
-    echo "Install with: apt update && apt install -y rsync"
-    log_message "⚠ rsync not installed"
-else
-    echo "✓ rsync is available"
-    log_message "✓ rsync is available"
-fi
-
 echo
 echo "========================================"
 echo "  Setup Complete!"
@@ -342,17 +174,17 @@ echo "========================================"
 echo
 echo "Next steps:"
 echo "1. Copy your backup scripts to /root/production/scripts/"
-echo "2. Verify Tailscale connectivity: tailscale status"
-echo "3. Configure your NAS: /root/production/scripts/02-tailscale-discovery.sh"
-echo "4. Test backup with: /root/production/scripts/docker-backup.sh"
-echo "5. Add cron jobs from: /root/example-crontab.txt"
-echo "6. Start Portainer with: /root/production/scripts/03-deploy-portainer.sh"
+echo "2. Configure S3 storage: /root/production/scripts/s3-backup-config.sh"
+echo "3. Test backup with: /root/production/scripts/docker-backup.sh"
+echo "4. Add cron jobs from: /root/example-crontab.txt"
+echo "5. Start Portainer with: /root/production/scripts/03-deploy-portainer.sh"
 echo
-if tailscale status >/dev/null 2>&1; then
-    echo "Tailscale Status:"
-    tailscale status | head -10
-    echo
-fi
+echo "S3 Configuration Notes:"
+echo "- No Tailscale required for S3 backups"
+echo "- Ensure your MinIO instance is accessible over HTTPS"
+echo "- Use strong, unique credentials for backup service account"
+echo "- Enable bucket versioning for backup protection"
+echo
 echo "Log file: $LOG_FILE"
 
-log_message "=== Backup Environment Setup Completed ==="
+log_message "=== S3 Backup Environment Setup Completed ==="

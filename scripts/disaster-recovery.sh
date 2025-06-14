@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Disaster Recovery Script
+# Disaster Recovery Script - S3 Version
 # Complete system restoration from backup when no containers exist
 
 set -euo pipefail
@@ -21,7 +21,7 @@ show_disaster_recovery_header() {
     echo "========================================"
     echo
     echo "This script will:"
-    echo "- Restore data from backup"
+    echo "- Restore data from backup (local or S3)"
     echo "- Recreate Docker network"
     echo "- Deploy Portainer in bootstrap mode"
     echo "- Guide you through stack restoration"
@@ -34,8 +34,8 @@ restore_data_from_backup() {
     echo "Step 1: Restoring data from backup..."
     echo
 
-    # Call the existing restore script
-    if ! /root/production/scripts/docker-restore.sh; then
+    # Use the S3-compatible restore script
+    if ! /root/production/scripts/docker-restore-s3.sh; then
         log_message "✗ Data restoration failed"
         echo "✗ Data restoration failed"
         return 1
@@ -182,7 +182,7 @@ Generated: $(date)
 Recovery Session: $TIMESTAMP
 
 ## ✅ Completed Automatically
-- [x] Data restored from backup
+- [x] Data restored from backup (local or S3)
 - [x] Docker network recreated
 - [x] Portainer deployed in bootstrap mode
 
@@ -226,7 +226,7 @@ fi)
 
 ### 5. Backup System Verification
 - [ ] Test backup system: backup-now
-- [ ] Verify Tailscale connectivity: tailscale-test
+- [ ] Verify S3 connectivity: s3-helper.sh test
 - [ ] Check automated jobs: backup-health
 
 ## 📂 Important Files
@@ -241,7 +241,7 @@ fi)
 2. Verify Docker: docker ps -a
 3. Check networks: docker network ls
 4. Restart Portainer: /root/production/scripts/03-deploy-portainer.sh --bootstrap
-5. Check Tailscale: tailscale-test
+5. Check S3 connectivity: s3-helper.sh test
 
 Recovery completed on: $(date)
 EOF
@@ -280,6 +280,7 @@ show_completion_summary() {
     echo "🔧 Useful Commands:"
     echo "  • Manual backup test: backup-now"
     echo "  • System health: backup-health"
+    echo "  • S3 connectivity: s3-helper.sh test"
     echo "  • Portainer production mode: ./03-deploy-portainer.sh --production"
     echo
 }
@@ -359,14 +360,14 @@ fi
 
 # Show help if requested
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    echo "Disaster Recovery Script"
+    echo "Disaster Recovery Script - S3 Version"
     echo
     echo "Complete system restoration when no containers exist."
     echo
     echo "Usage: $0"
     echo
     echo "This script:"
-    echo "- Restores all data from backup"
+    echo "- Restores all data from backup (local or S3)"
     echo "- Recreates Docker infrastructure"
     echo "- Deploys Portainer in bootstrap mode"
     echo "- Provides guidance for application stack restoration"

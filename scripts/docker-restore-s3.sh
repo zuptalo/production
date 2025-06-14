@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Docker Infrastructure Restore Script
-# This script safely restores from local or remote backups with container management
+# S3 Backup Restore Script
+# Restores backups from S3-compatible storage
 
 set -euo pipefail
 
@@ -9,24 +9,18 @@ set -euo pipefail
 BACKUP_BASE_DIR="/root/backup"
 CONFIG_FILE="/root/.backup-config"
 
-# Load configuration if it exists
+# Load configuration
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
 else
-    # Fallback to default values
-    NAS_IP="${NAS_IP:-YOUR_NAS_IP}"
-    SSH_USER="${SSH_USER:-backup-user}"
-    REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/volume1/backup/$(hostname)}"
-    echo "⚠ No configuration file found. Using defaults. Run 02-tailscale-discovery.sh first."
+    echo "✗ No configuration file found. Run s3-backup-config.sh first."
+    exit 1
 fi
 
-LOG_FILE="/var/log/docker-restore.log"
+LOG_FILE="/var/log/s3-restore.log"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CONTAINER_STATE_FILE="/tmp/restore_container_states_${TIMESTAMP}.txt"
-
-# SSH options for remote access
-SSH_OPTS="-i /root/.ssh/backup_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes"
 
 # Function to log messages
 log_message() {
@@ -36,9 +30,187 @@ log_message() {
 # Function to show header
 show_header() {
     echo "========================================"
-    echo "  Docker Infrastructure Restore Tool"
+    echo "  S3 Backup Restore Tool"
     echo "========================================"
     echo
+}
+
+# Function to create S3 signature
+create_s3_signature() {
+    local method="$1"
+    local content_md5="$2"
+    local content_type="$3"
+    local date="$4"
+    local resource="$5"
+
+    local string_to_sign="${method}\n${content_md5}\n${content_type}\n${date}\n${resource}"
+    echo -n "$string_to_sign" | openssl sha1 -hmac "$S3_SECRET_KEY" -binary | base64
+}
+
+# Function to list S3 backups
+list_s3_backups() {
+    echo "S3 Backups Available:"
+    echo "---------------------"
+
+    # Create date for request
+    local date
+    date=$(date -u "+%a, %d %b %Y %H:%M:%S GMT")
+
+    # Create resource path
+    local resource="/${S3_BUCKET}/?prefix=${S3_HOSTNAME}/&delimiter=/"
+
+    # Create signature
+    local signature
+    signature=$(create_s3_signature "GET" "" "" "$date" "/${S3_BUCKET}/")
+
+    # Extract host from endpoint
+    local host
+    host=$(echo "$S3_ENDPOINT" | sed 's|https\?://||')
+
+    # List objects and parse backup directories
+    local s3_response
+    s3_response=$(curl -s -f \
+        -H "Host: $host" \
+        -H "Date: $date" \
+        -H "Authorization: AWS ${S3_ACCESS_KEY}:${signature}" \
+        "${S3_ENDPOINT}${resource}" 2>/dev/null)
+
+    if [ -z "$s3_response" ]; then
+        echo "No S3 backups found or connection failed"
+        echo "COUNT:0"
+        return 1
+    fi
+
+    # Extract backup directories using grep and sed
+    local backups=()
+    local counter=1
+
+    # Look for common prefixes that represent backup directories
+    while IFS= read -r line; do
+        if [[ "$line" =~ \<Prefix\>([^<]+)\</Prefix\> ]]; then
+            local prefix="${BASH_REMATCH[1]}"
+            # Remove the hostname prefix and trailing slash
+            local backup_name
+            backup_name=$(echo "$prefix" | sed "s|${S3_HOSTNAME}/||" | sed 's|/$||')
+
+            # Check if it matches backup directory pattern
+            if [[ "$backup_name" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
+                backups+=("$backup_name")
+
+                # Format date and time for display
+                local backup_date
+                backup_date=$(date -d "${backup_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
+                local backup_time="${backup_name:9:2}:${backup_name:11:2}:${backup_name:13:2}"
+
+                printf "%2d) %s - %s %s\n" "$counter" "$backup_name" "$backup_date" "$backup_time"
+                ((counter++))
+            fi
+        fi
+    done <<< "$s3_response"
+
+    # Return count and backup list
+    echo "COUNT:${#backups[@]}"
+    for backup in "${backups[@]}"; do
+        echo "BACKUP:$backup"
+    done
+}
+
+# Function to download S3 backup
+download_s3_backup() {
+    local backup_name="$1"
+    local local_temp_dir="/tmp/s3_restore_${backup_name}"
+
+    log_message "Downloading S3 backup: $backup_name"
+    echo "Downloading backup from S3..." >&2
+    echo "Source: s3://${S3_BUCKET}/${S3_HOSTNAME}/$backup_name/" >&2
+    echo "Destination: $local_temp_dir/" >&2
+
+    # Create temporary directory
+    mkdir -p "$local_temp_dir"
+
+    # List all objects in the backup directory
+    local date
+    date=$(date -u "+%a, %d %b %Y %H:%M:%S GMT")
+
+    local resource="/${S3_BUCKET}/?prefix=${S3_HOSTNAME}/${backup_name}/"
+    local signature
+    signature=$(create_s3_signature "GET" "" "" "$date" "/${S3_BUCKET}/")
+
+    local host
+    host=$(echo "$S3_ENDPOINT" | sed 's|https\?://||')
+
+    # Get list of objects
+    local s3_response
+    s3_response=$(curl -s -f \
+        -H "Host: $host" \
+        -H "Date: $date" \
+        -H "Authorization: AWS ${S3_ACCESS_KEY}:${signature}" \
+        "${S3_ENDPOINT}${resource}" 2>/dev/null)
+
+    if [ -z "$s3_response" ]; then
+        echo "✗ Failed to list S3 objects" >&2
+        rm -rf "$local_temp_dir"
+        return 1
+    fi
+
+    # Download each file
+    local download_count=0
+    local error_count=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ \<Key\>([^<]+)\</Key\> ]]; then
+            local s3_key="${BASH_REMATCH[1]}"
+
+            # Skip if it's just the directory prefix
+            if [[ "$s3_key" =~ /$ ]]; then
+                continue
+            fi
+
+            # Extract relative path within backup
+            local relative_path
+            relative_path=$(echo "$s3_key" | sed "s|${S3_HOSTNAME}/${backup_name}/||")
+            local local_file_path="${local_temp_dir}/${relative_path}"
+
+            # Create directory if needed
+            mkdir -p "$(dirname "$local_file_path")"
+
+            # Download file
+            echo "Downloading: $relative_path" >&2
+
+            local file_date
+            file_date=$(date -u "+%a, %d %b %Y %H:%M:%S GMT")
+
+            local file_resource="/${S3_BUCKET}/${s3_key}"
+            local file_signature
+            file_signature=$(create_s3_signature "GET" "" "" "$file_date" "$file_resource")
+
+            if curl -s -f \
+                -H "Host: $host" \
+                -H "Date: $file_date" \
+                -H "Authorization: AWS ${S3_ACCESS_KEY}:${file_signature}" \
+                -o "$local_file_path" \
+                "${S3_ENDPOINT}${file_resource}"; then
+
+                ((download_count++))
+            else
+                echo "✗ Failed to download: $relative_path" >&2
+                ((error_count++))
+            fi
+        fi
+    done <<< "$s3_response"
+
+    echo "Download completed: $download_count files downloaded, $error_count errors" >&2
+    log_message "Downloaded $download_count files with $error_count errors"
+
+    if [ "$download_count" -eq 0 ]; then
+        echo "✗ No files downloaded" >&2
+        rm -rf "$local_temp_dir"
+        return 1
+    fi
+
+    # ONLY output the directory path to stdout for capture
+    echo "$local_temp_dir"
+    return 0
 }
 
 # Function to get running containers
@@ -55,22 +227,18 @@ stop_all_containers() {
     log_message "Stopping all Docker containers..."
     echo "Stopping all Docker containers gracefully..."
 
-    # Get list of running containers with better error handling
     local running_containers
     running_containers=$(docker ps -q 2>/dev/null || echo "")
 
     if [ -n "$running_containers" ]; then
         echo "Found containers to stop: $(echo "$running_containers" | wc -l)"
 
-        # Stop containers one by one for better error handling
         echo "$running_containers" | while read -r container_id; do
             if [ -n "$container_id" ]; then
-                # Fixed: Better container name extraction
                 local container_name
                 container_name=$(docker inspect "$container_id" --format '{{.Name}}' 2>/dev/null | sed 's|^/||' || echo "unknown")
                 echo "Stopping container: $container_name ($container_id)"
 
-                # Fixed: Use --timeout instead of deprecated --time
                 if docker stop "$container_id" --timeout 30 2>/dev/null; then
                     log_message "✓ Stopped: $container_name ($container_id)"
                     echo "✓ Stopped: $container_name"
@@ -114,140 +282,6 @@ start_containers() {
 
     # Cleanup temp file
     rm -f "$CONTAINER_STATE_FILE"
-}
-
-# Function to list local backups
-list_local_backups() {
-    echo "Local Backups Available:"
-    echo "------------------------"
-
-    local backups=()
-    local counter=1
-
-    # Find all backup directories
-    while IFS= read -r backup_dir; do
-        if [ -d "$backup_dir" ]; then
-            local backup_name
-            backup_name=$(basename "$backup_dir")
-            local backup_size
-            backup_size=$(du -sh "$backup_dir" 2>/dev/null | cut -f1)
-            local backup_date
-            backup_date=$(date -d "${backup_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
-            local backup_time="${backup_name:9:2}:${backup_name:11:2}:${backup_name:13:2}"
-
-            backups+=("$backup_dir")
-            printf "%2d) %s (%s) - %s %s\n" "$counter" "$backup_name" "$backup_size" "$backup_date" "$backup_time"
-            ((counter++))
-        fi
-    done < <(find "$BACKUP_BASE_DIR" -maxdepth 1 -type d -name "[0-9]*_[0-9]*" | sort -r)
-
-    # Return count and backup list in a format we can parse
-    echo "COUNT:${#backups[@]}"
-    for backup in "${backups[@]}"; do
-        echo "BACKUP:$backup"
-    done
-}
-
-# Function to list remote backups - FIXED VERSION
-list_remote_backups() {
-    echo "Remote Backups Available:"
-    echo "-------------------------"
-
-    # Test SSH connection
-    if ! ssh $SSH_OPTS "$SSH_USER@$NAS_IP" "exit" 2>/dev/null; then
-        echo "✗ Cannot connect to NAS"
-        return 1
-    fi
-
-    echo "✓ SSH connection successful"
-
-    # Get remote backup list
-    local remote_list
-    remote_list=$(ssh $SSH_OPTS "$SSH_USER@$NAS_IP" "find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type d -name '[0-9]*_[0-9]*' | sort -r" 2>/dev/null)
-
-    if [ -z "$remote_list" ]; then
-        echo "No remote backups found in $REMOTE_BACKUP_DIR"
-        echo "COUNT:0"
-        return 0
-    fi
-
-    local backups=()
-    local counter=1
-
-    # Process each backup using array approach (which we know works from testing)
-    IFS=$'\n' read -d '' -r -a backup_array <<< "$remote_list"
-
-    for backup_path in "${backup_array[@]}"; do
-        if [ -n "$backup_path" ] && [ "$backup_path" != "$REMOTE_BACKUP_DIR" ]; then
-            local backup_name
-            backup_name=$(basename "$backup_path")
-
-            # Validate backup directory name format
-            if [[ "$backup_name" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
-                # Get size
-                local backup_size
-                backup_size=$(ssh $SSH_OPTS "$SSH_USER@$NAS_IP" "du -sh '$backup_path' 2>/dev/null | cut -f1" 2>/dev/null || echo "Unknown")
-
-                # Format date and time
-                local backup_date
-                backup_date=$(date -d "${backup_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
-                local backup_time="${backup_name:9:2}:${backup_name:11:2}:${backup_name:13:2}"
-
-                backups+=("$backup_path")
-                printf "%2d) %s (%s) - %s %s\n" "$counter" "$backup_name" "$backup_size" "$backup_date" "$backup_time"
-                ((counter++))
-            fi
-        fi
-    done
-
-    # Return count and backup list
-    echo "COUNT:${#backups[@]}"
-    for backup in "${backups[@]}"; do
-        echo "BACKUP:$backup"
-    done
-}
-
-# Function to download remote backup
-download_remote_backup() {
-    local remote_backup_path="$1"
-    local backup_name
-    backup_name=$(basename "$remote_backup_path")
-    local local_temp_dir="/tmp/restore_${backup_name}"
-
-    log_message "Downloading remote backup: $backup_name"
-    echo "Downloading backup from NAS..." >&2
-    echo "Source: $SSH_USER@$NAS_IP:$remote_backup_path/" >&2
-    echo "Destination: $local_temp_dir/" >&2
-
-    # Create temporary directory
-    mkdir -p "$local_temp_dir"
-
-    # Download backup files using rsync
-    echo "Starting rsync transfer..." >&2
-    if rsync -avz --progress \
-        -e "ssh $SSH_OPTS" \
-        "$SSH_USER@$NAS_IP:$remote_backup_path/" \
-        "$local_temp_dir/" >&2 2>&1; then
-
-        log_message "✓ Remote backup downloaded successfully"
-        echo "✓ Download completed" >&2
-
-        # Verify files were downloaded
-        local file_count
-        file_count=$(find "$local_temp_dir" -type f | wc -l)
-        echo "Downloaded $file_count files to $local_temp_dir" >&2
-        log_message "Downloaded $file_count files"
-
-        # ONLY output the directory path to stdout for capture
-        echo "$local_temp_dir"
-    else
-        log_message "✗ Failed to download remote backup"
-        echo "✗ Download failed" >&2
-        echo "Debug: Checking if temp directory exists..." >&2
-        ls -la "$local_temp_dir" >&2 2>/dev/null || echo "Temp directory doesn't exist" >&2
-        rm -rf "$local_temp_dir"
-        return 1
-    fi
 }
 
 # Function to verify backup integrity
@@ -383,14 +417,14 @@ restore_from_backup() {
     echo "✓ Restore completed"
 }
 
-# Function to restore ownerships from backup
+# Function to restore ownership from metadata
 restore_ownership_from_metadata() {
     local backup_dir="$1"
     local restore_script="${backup_dir}/restore_ownership.sh"
 
     if [ -f "$restore_script" ] && [ -x "$restore_script" ]; then
         echo "Applying ownership restoration from backup metadata..."
-        log_message "Executing generic ownership restoration"
+        log_message "Executing ownership restoration"
 
         if "$restore_script"; then
             echo "✓ Ownership restored from backup metadata"
@@ -408,14 +442,21 @@ restore_ownership_from_metadata() {
 # Function to cleanup temporary files
 cleanup_temp_files() {
     # Remove any temporary download directories
-    find /tmp -maxdepth 1 -name "restore_[0-9]*_[0-9]*" -type d -mmin +60 -exec rm -rf {} \; 2>/dev/null || true
+    find /tmp -maxdepth 1 -name "s3_restore_[0-9]*_[0-9]*" -type d -mmin +60 -exec rm -rf {} \; 2>/dev/null || true
     log_message "Cleaned up temporary files"
 }
 
 # Main restore function
 main() {
     show_header
-    log_message "=== Starting Docker Infrastructure Restore ==="
+    log_message "=== Starting S3 Backup Restore ==="
+
+    # Check if configuration is for S3
+    if [ "${BACKUP_TYPE:-}" != "s3" ]; then
+        echo "✗ This system is not configured for S3 backups"
+        log_message "✗ System not configured for S3 backups"
+        exit 1
+    fi
 
     # Check if Docker is running
     if ! docker info >/dev/null 2>&1; then
@@ -429,45 +470,52 @@ main() {
 
     echo "Select backup source:"
     echo "1) Local backups"
-    echo "2) Remote backups (NAS)"
+    echo "2) S3 backups"
     echo
     read -p "Enter choice (1-2): " source_choice
 
     local backup_dir=""
-    local is_remote=false
+    local is_s3=false
 
     case $source_choice in
         1)
             echo
-            # List local backups and get selection
-            local local_output
-            local_output=$(list_local_backups)
+            # Use existing local backup listing from the original script
+            if [ ! -d "$BACKUP_BASE_DIR" ] || [ -z "$(ls -A "$BACKUP_BASE_DIR" 2>/dev/null)" ]; then
+                echo "No local backups found."
+                exit 1
+            fi
 
-            # Display the output (everything except COUNT: and BACKUP: lines)
-            echo "$local_output" | grep -v "^COUNT:" | grep -v "^BACKUP:"
+            echo "Local Backups Available:"
+            echo "------------------------"
 
-            # Parse the output to get count and backup list
-            local backup_count=0
-            local backup_list=()
+            local backups=()
+            local counter=1
 
-            while IFS= read -r line; do
-                if [[ "$line" =~ ^COUNT:([0-9]+)$ ]]; then
-                    backup_count="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^BACKUP:(.+)$ ]]; then
-                    backup_list+=("${BASH_REMATCH[1]}")
+            while IFS= read -r backup_dir_name; do
+                if [ -d "$BACKUP_BASE_DIR/$backup_dir_name" ]; then
+                    local backup_size
+                    backup_size=$(du -sh "$BACKUP_BASE_DIR/$backup_dir_name" 2>/dev/null | cut -f1)
+                    local backup_date
+                    backup_date=$(date -d "${backup_dir_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
+                    local backup_time="${backup_dir_name:9:2}:${backup_dir_name:11:2}:${backup_dir_name:13:2}"
+
+                    backups+=("$BACKUP_BASE_DIR/$backup_dir_name")
+                    printf "%2d) %s (%s) - %s %s\n" "$counter" "$backup_dir_name" "$backup_size" "$backup_date" "$backup_time"
+                    ((counter++))
                 fi
-            done <<< "$local_output"
+            done < <(find "$BACKUP_BASE_DIR" -maxdepth 1 -type d -name "[0-9]*_[0-9]*" | sort -r | xargs -n1 basename)
 
-            if [ "$backup_count" -eq 0 ]; then
+            if [ "${#backups[@]}" -eq 0 ]; then
                 echo "No local backups found."
                 exit 1
             fi
 
             echo
-            read -p "Enter backup number to restore (1-$backup_count): " backup_choice
+            read -p "Enter backup number to restore (1-${#backups[@]}): " backup_choice
 
-            if [[ "$backup_choice" =~ ^[0-9]+$ ]] && [ "$backup_choice" -ge 1 ] && [ "$backup_choice" -le "$backup_count" ]; then
-                backup_dir="${backup_list[$((backup_choice-1))]}"
+            if [[ "$backup_choice" =~ ^[0-9]+$ ]] && [ "$backup_choice" -ge 1 ] && [ "$backup_choice" -le "${#backups[@]}" ]; then
+                backup_dir="${backups[$((backup_choice-1))]}"
             else
                 echo "Invalid selection"
                 exit 1
@@ -475,18 +523,18 @@ main() {
             ;;
         2)
             echo
-            # List remote backups and get selection
-            local remote_output
-            remote_output=$(list_remote_backups)
+            # List S3 backups and get selection
+            local s3_output
+            s3_output=$(list_s3_backups)
 
             # Check if listing was successful
             if [ $? -ne 0 ]; then
-                echo "Failed to list remote backups"
+                echo "Failed to list S3 backups"
                 exit 1
             fi
 
             # Display the output (everything except COUNT: and BACKUP: lines)
-            echo "$remote_output" | grep -v "^COUNT:" | grep -v "^BACKUP:"
+            echo "$s3_output" | grep -v "^COUNT:" | grep -v "^BACKUP:"
 
             # Parse the output to get count and backup list
             local backup_count=0
@@ -498,10 +546,10 @@ main() {
                 elif [[ "$line" =~ ^BACKUP:(.+)$ ]]; then
                     backup_list+=("${BASH_REMATCH[1]}")
                 fi
-            done <<< "$remote_output"
+            done <<< "$s3_output"
 
             if [ "$backup_count" -eq 0 ]; then
-                echo "No remote backups found."
+                echo "No S3 backups found."
                 exit 1
             fi
 
@@ -509,9 +557,9 @@ main() {
             read -p "Enter backup number to restore (1-$backup_count): " backup_choice
 
             if [[ "$backup_choice" =~ ^[0-9]+$ ]] && [ "$backup_choice" -ge 1 ] && [ "$backup_choice" -le "$backup_count" ]; then
-                local remote_backup_path="${backup_list[$((backup_choice-1))]}"
-                backup_dir=$(download_remote_backup "$remote_backup_path")
-                is_remote=true
+                local s3_backup_name="${backup_list[$((backup_choice-1))]}"
+                backup_dir=$(download_s3_backup "$s3_backup_name")
+                is_s3=true
             else
                 echo "Invalid selection"
                 exit 1
@@ -552,7 +600,7 @@ main() {
 
     if [ "$confirm" != "yes" ]; then
         echo "Restore cancelled"
-        if [ "$is_remote" = true ]; then
+        if [ "$is_s3" = true ]; then
             rm -rf "$backup_dir"
         fi
         exit 0
@@ -574,14 +622,14 @@ main() {
     # Perform restore
     restore_from_backup "$backup_dir"
 
-    # Perform ownership restore from metadata backup
+    # Perform ownership restore from metadata
     restore_ownership_from_metadata "$backup_dir"
 
     # Restart containers
     start_containers
 
     # Cleanup
-    if [ "$is_remote" = true ]; then
+    if [ "$is_s3" = true ]; then
         echo "Cleaning up downloaded backup: $backup_dir"
         rm -rf "$backup_dir"
     fi
@@ -596,7 +644,7 @@ main() {
     echo "Log file: $LOG_FILE"
     echo
 
-    log_message "=== Restore Completed Successfully ==="
+    log_message "=== S3 Restore Completed Successfully ==="
 }
 
 # Run main function
