@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# S3 Backup Transfer Script
-# Transfers local backups to S3-compatible storage using curl
+# MC-Based S3 Backup Transfer Script
+# Uses MinIO client for reliable S3 transfers
 
 set -euo pipefail
 
@@ -25,92 +25,60 @@ log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
 
-# Function to create S3 signature
-create_s3_signature() {
-    local method="$1"
-    local content_md5="$2"
-    local content_type="$3"
-    local date="$4"
-    local resource="$5"
+# Function to ensure MC alias is configured
+ensure_mc_alias() {
+    local alias_name="${S3_ALIAS_NAME:-backup-s3}"
 
-    local string_to_sign="${method}\n${content_md5}\n${content_type}\n${date}\n${resource}"
-    echo -n "$string_to_sign" | openssl sha1 -hmac "$S3_SECRET_KEY" -binary | base64
+    if ! mc alias list | grep -q "^${alias_name}"; then
+        log_message "Configuring MC alias: $alias_name"
+        if mc alias set "$alias_name" "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY"; then
+            log_message "✓ MC alias configured successfully"
+        else
+            log_message "✗ Failed to configure MC alias"
+            return 1
+        fi
+    else
+        log_message "✓ MC alias already configured"
+    fi
+
+    echo "$alias_name"
 }
 
-# Function to upload file to S3
+# Function to upload file to S3 using MC
 upload_to_s3() {
     local local_file="$1"
-    local s3_key="$2"
-    local content_type="${3:-application/octet-stream}"
+    local s3_path="$2"
+    local alias_name="$3"
 
-    log_message "Uploading: $(basename "$local_file") -> $s3_key"
+    log_message "Uploading: $(basename "$local_file") -> $s3_path"
 
-    # Calculate file hash and size
-    local content_md5
-    content_md5=$(openssl md5 -binary "$local_file" | base64)
-    local content_length
-    content_length=$(stat -f%z "$local_file" 2>/dev/null || stat -c%s "$local_file")
-
-    # Create date
-    local date
-    date=$(date -u "+%a, %d %b %Y %H:%M:%S GMT")
-
-    # Create resource path
-    local resource="/${S3_BUCKET}/${s3_key}"
-
-    # Create signature
-    local signature
-    signature=$(create_s3_signature "PUT" "$content_md5" "$content_type" "$date" "$resource")
-
-    # Extract host from endpoint
-    local host
-    host=$(echo "$S3_ENDPOINT" | sed 's|https\?://||')
-
-    # Upload file
-    if curl -s -f -X PUT \
-        -H "Host: $host" \
-        -H "Date: $date" \
-        -H "Content-Type: $content_type" \
-        -H "Content-MD5: $content_md5" \
-        -H "Content-Length: $content_length" \
-        -H "Authorization: AWS ${S3_ACCESS_KEY}:${signature}" \
-        -H "x-amz-tagging: hostname=${S3_HOSTNAME}" \
-        --data-binary "@${local_file}" \
-        "${S3_ENDPOINT}${resource}" 2>&1; then
-
+    if mc cp "$local_file" "${alias_name}/${S3_BUCKET}/${s3_path}" 2>/dev/null; then
         log_message "✓ Successfully uploaded: $(basename "$local_file")"
         return 0
     else
         log_message "✗ Failed to upload: $(basename "$local_file")"
+        # Show actual error for debugging
+        echo "Debug: Attempting upload again with error output..."
+        mc cp "$local_file" "${alias_name}/${S3_BUCKET}/${s3_path}"
         return 1
     fi
 }
 
-# Function to list S3 objects
-list_s3_objects() {
-    local prefix="$1"
+# Function to upload directory to S3 using MC
+upload_directory_to_s3() {
+    local local_dir="$1"
+    local s3_path="$2"
+    local alias_name="$3"
 
-    # Create date for request
-    local date
-    date=$(date -u "+%a, %d %b %Y %H:%M:%S GMT")
+    log_message "Uploading directory: $local_dir -> $s3_path"
 
-    # Create resource path
-    local resource="/${S3_BUCKET}/?prefix=${prefix}"
-
-    # Create signature
-    local signature
-    signature=$(create_s3_signature "GET" "" "" "$date" "/${S3_BUCKET}/")
-
-    # Extract host from endpoint
-    local host
-    host=$(echo "$S3_ENDPOINT" | sed 's|https\?://||')
-
-    # List objects
-    curl -s -f \
-        -H "Host: $host" \
-        -H "Date: $date" \
-        -H "Authorization: AWS ${S3_ACCESS_KEY}:${signature}" \
-        "${S3_ENDPOINT}${resource}" || return 1
+    if mc mirror "$local_dir" "${alias_name}/${S3_BUCKET}/${s3_path}"; then
+        log_message "✓ Successfully uploaded directory: $(basename "$local_dir")"
+        return 0
+    else
+        log_message "✗ Failed to upload directory: $(basename "$local_dir")"
+        return 1
+    fi
 }
 
 # Function to transfer latest backup
@@ -129,45 +97,35 @@ transfer_latest_backup() {
     log_message "Source: $latest_backup"
     log_message "Destination: s3://${S3_BUCKET}/${S3_HOSTNAME}/$backup_name"
 
-    # Upload all files in the backup directory
-    local upload_count=0
-    local error_count=0
+    # Ensure MC alias is configured
+    local alias_name
+    alias_name=$(ensure_mc_alias)
+    if [ $? -ne 0 ]; then
+        log_message "✗ Failed to configure MC alias"
+        return 1
+    fi
 
-    while IFS= read -r -d '' file; do
-        local relative_path
-        relative_path=$(echo "$file" | sed "s|$latest_backup/||")
-        local s3_key="${S3_HOSTNAME}/${backup_name}/${relative_path}"
+    # Upload entire backup directory using mirror
+    local s3_backup_path="${S3_HOSTNAME}/${backup_name}"
 
-        # Determine content type
-        local content_type="application/octet-stream"
-        case "$file" in
-            *.tar.gz) content_type="application/gzip" ;;
-            *.json) content_type="application/json" ;;
-            *.txt) content_type="text/plain" ;;
-            *.sha256) content_type="text/plain" ;;
-        esac
-
-        if upload_to_s3 "$file" "$s3_key" "$content_type"; then
-            ((upload_count++))
-        else
-            ((error_count++))
-        fi
-    done < <(find "$latest_backup" -type f -print0)
-
-    log_message "Transfer completed: $upload_count files uploaded, $error_count errors"
-
-    if [ "$error_count" -eq 0 ]; then
-        log_message "✓ All files transferred successfully"
+    echo "Uploading backup directory to S3..."
+    if upload_directory_to_s3 "$latest_backup" "$s3_backup_path" "$alias_name"; then
+        log_message "✓ Backup directory transfer completed successfully"
 
         # Create a "latest" marker file
         local latest_marker="/tmp/latest_backup_marker"
         echo "$backup_name" > "$latest_marker"
-        upload_to_s3 "$latest_marker" "${S3_HOSTNAME}/latest.txt" "text/plain"
-        rm -f "$latest_marker"
 
+        if upload_to_s3 "$latest_marker" "${S3_HOSTNAME}/latest.txt" "$alias_name"; then
+            log_message "✓ Latest backup marker updated"
+        else
+            log_message "⚠ Failed to update latest backup marker"
+        fi
+
+        rm -f "$latest_marker"
         return 0
     else
-        log_message "✗ Some files failed to transfer"
+        log_message "✗ Backup directory transfer failed"
         return 1
     fi
 }
@@ -178,11 +136,16 @@ verify_s3_backup() {
     backup_name=$(basename "$(readlink -f "$LOCAL_BACKUP_DIR/latest")")
     log_message "Verifying S3 backup integrity..."
 
-    # List objects to verify they exist
-    log_message "Checking S3 objects for backup: $backup_name"
+    local alias_name="${S3_ALIAS_NAME:-backup-s3}"
+    local s3_backup_path="${alias_name}/${S3_BUCKET}/${S3_HOSTNAME}/${backup_name}"
 
-    if list_s3_objects "${S3_HOSTNAME}/${backup_name}/" >/dev/null 2>&1; then
-        log_message "✓ S3 backup verification successful"
+    # List files to verify they exist
+    log_message "Checking S3 backup contents for: $backup_name"
+
+    if mc ls "$s3_backup_path/" >/dev/null 2>&1; then
+        local file_count
+        file_count=$(mc ls "$s3_backup_path/" | wc -l)
+        log_message "✓ S3 backup verification successful - $file_count files found"
         return 0
     else
         log_message "✗ S3 backup verification failed"
@@ -195,10 +158,38 @@ cleanup_old_s3_backups() {
     local keep_count=30
     log_message "Cleaning up old S3 backups (keeping last $keep_count)..."
 
-    # Note: This is simplified - in production you might want to use AWS CLI or mc
-    # for more sophisticated cleanup based on actual backup dates
-    log_message "S3 cleanup requires manual implementation with AWS CLI or mc client"
-    log_message "Consider setting up lifecycle policies on your S3 bucket"
+    local alias_name="${S3_ALIAS_NAME:-backup-s3}"
+    local s3_path="${alias_name}/${S3_BUCKET}/${S3_HOSTNAME}"
+
+    # List backup directories (they follow YYYYMMDD_HHMMSS pattern)
+    local backup_dirs
+    backup_dirs=$(mc ls "$s3_path/" 2>/dev/null | grep "PRE" | awk '{print $2}' | sed 's|/$||' | grep '^[0-9]\{8\}_[0-9]\{6\}$' | sort -r)
+
+    if [ -z "$backup_dirs" ]; then
+        log_message "No backup directories found for cleanup"
+        return 0
+    fi
+
+    local backup_count
+    backup_count=$(echo "$backup_dirs" | wc -l)
+
+    if [ "$backup_count" -gt "$keep_count" ]; then
+        local dirs_to_remove
+        dirs_to_remove=$(echo "$backup_dirs" | tail -n +$((keep_count + 1)))
+
+        echo "$dirs_to_remove" | while read -r old_backup; do
+            if [ -n "$old_backup" ]; then
+                log_message "Removing old backup: $old_backup"
+                if mc rm --recursive --force "${s3_path}/${old_backup}/" 2>/dev/null; then
+                    log_message "✓ Removed old backup: $old_backup"
+                else
+                    log_message "⚠ Could not remove old backup: $old_backup (expected with write-only policy)"
+                fi
+            fi
+        done
+    else
+        log_message "No old backups to clean up ($backup_count <= $keep_count)"
+    fi
 }
 
 # Function to show backup summary
@@ -207,19 +198,20 @@ show_backup_summary() {
 
     # Local backup info
     local latest_backup
-    latest_backup=$(readlink -f "$LOCAL_BACKUP_DIR/latest")
-    local local_size
-    local_size=$(du -sh "$latest_backup" 2>/dev/null | cut -f1)
-    log_message "Local backup: $(basename "$latest_backup") ($local_size)"
+    latest_backup=$(readlink -f "$LOCAL_BACKUP_DIR/latest" 2>/dev/null || echo "")
+    if [ -n "$latest_backup" ]; then
+        local local_size
+        local_size=$(du -sh "$latest_backup" 2>/dev/null | cut -f1)
+        log_message "Local backup: $(basename "$latest_backup") ($local_size)"
+    fi
 
     # S3 backup info
-    local backup_name
-    backup_name=$(basename "$latest_backup")
-    log_message "S3 location: s3://${S3_BUCKET}/${S3_HOSTNAME}/$backup_name"
+    local alias_name="${S3_ALIAS_NAME:-backup-s3}"
+    log_message "S3 location: s3://${S3_BUCKET}/${S3_HOSTNAME}/"
 
     # List recent backups
     log_message "Recent S3 backups:"
-    if list_s3_objects "${S3_HOSTNAME}/" 2>/dev/null | grep -o "${S3_HOSTNAME}/[0-9]*_[0-9]*" | sort -u | tail -5; then
+    if mc ls "${alias_name}/${S3_BUCKET}/${S3_HOSTNAME}/" 2>/dev/null | grep "PRE" | tail -5; then
         log_message "✓ S3 backup listing successful"
     else
         log_message "⚠ Could not list S3 backups"
@@ -228,11 +220,18 @@ show_backup_summary() {
 
 # Main function
 main() {
-    log_message "=== Starting S3 Backup Transfer ==="
+    log_message "=== Starting MC-Based S3 Backup Transfer ==="
 
     # Check if configuration is for S3
     if [ "${BACKUP_TYPE:-}" != "s3" ]; then
         log_message "✗ This system is not configured for S3 backups"
+        exit 1
+    fi
+
+    # Check if MC is available
+    if ! command -v mc >/dev/null 2>&1; then
+        log_message "✗ MinIO client (mc) is not installed"
+        echo "Please run the S3 configuration script first"
         exit 1
     fi
 
@@ -253,10 +252,13 @@ main() {
         log_message "Warning: S3 backup verification had issues, but transfer completed"
     fi
 
+    # Attempt cleanup (may fail with write-only policy, which is expected)
+    cleanup_old_s3_backups
+
     # Show summary
     show_backup_summary
 
-    log_message "=== S3 Backup Transfer Completed Successfully ==="
+    log_message "=== MC-Based S3 Backup Transfer Completed Successfully ==="
 }
 
 # Run main function

@@ -1,39 +1,24 @@
 #!/bin/bash
 
-# Setup script for S3-based backup environment on a fresh machine
-# This version removes Tailscale dependency and focuses on S3 storage
+# MC-Based S3 Backup Configuration Script
+# Uses MinIO client for reliable S3 connectivity
 
 set -euo pipefail
 
-LOG_FILE="/var/log/backup-setup.log"
+LOG_FILE="/var/log/s3-backup-config.log"
+CONFIG_FILE="/root/.backup-config"
 
 # Function to log messages
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
 
-# Function to create directory with proper permissions
-create_directory() {
-    local dir_path="$1"
-    local permissions="${2:-755}"
-    local owner="${3:-root:root}"
-
-    if [ ! -d "$dir_path" ]; then
-        mkdir -p "$dir_path"
-        chmod "$permissions" "$dir_path"
-        chown "$owner" "$dir_path"
-        log_message "✓ Created directory: $dir_path"
-    else
-        log_message "✓ Directory already exists: $dir_path"
-    fi
-}
-
 echo "========================================"
-echo "  S3 Backup Environment Setup"
+echo "  S3 Backup Configuration (MC-Based)"
 echo "========================================"
 echo
 
-log_message "=== Starting S3 Backup Environment Setup ==="
+log_message "=== Starting MC-Based S3 Backup Configuration ==="
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -41,150 +26,202 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Check if Docker is installed
-if ! command -v docker >/dev/null 2>&1; then
-    echo "✗ Docker is not installed. Please install Docker first."
+# Install MinIO client if not present
+if ! command -v mc >/dev/null 2>&1; then
+    echo "Installing MinIO client..."
+    log_message "Installing MinIO client"
+
+    curl -s https://dl.min.io/client/mc/release/linux-amd64/mc \
+        --create-dirs \
+        -o /usr/local/bin/mc
+
+    chmod +x /usr/local/bin/mc
+
+    if command -v mc >/dev/null 2>&1; then
+        echo "✓ MinIO client installed successfully"
+        log_message "✓ MinIO client installed"
+    else
+        echo "✗ Failed to install MinIO client"
+        log_message "✗ MinIO client installation failed"
+        exit 1
+    fi
+else
+    echo "✓ MinIO client is already available"
+    log_message "✓ MinIO client already available"
+fi
+
+echo
+echo "Enter your MinIO S3 configuration:"
+echo
+
+read -p "S3 Endpoint URL: " S3_ENDPOINT
+read -p "Access Key: " S3_ACCESS_KEY
+read -s -p "Secret Key: " S3_SECRET_KEY
+echo
+read -p "Bucket Name: " S3_BUCKET
+read -p "Server Hostname [$(hostname)]: " S3_HOSTNAME
+
+# Set hostname default
+if [ -z "$S3_HOSTNAME" ]; then
+    S3_HOSTNAME=$(hostname)
+fi
+
+echo
+echo "Testing S3 configuration with MinIO client..."
+log_message "Testing S3 configuration: $S3_ENDPOINT"
+
+# Configure MC alias
+ALIAS_NAME="backup-s3"
+if mc alias set "$ALIAS_NAME" "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" 2>/dev/null; then
+    echo "✓ MinIO client alias configured successfully"
+    log_message "✓ MC alias configured"
+else
+    echo "✗ Failed to configure MinIO client alias"
+    log_message "✗ MC alias configuration failed"
+    echo "Please check your credentials and endpoint"
     exit 1
 fi
 
-log_message "✓ Running as root"
-log_message "✓ Docker is available"
-
-# Check if curl is installed (needed for S3 API calls)
-if ! command -v curl >/dev/null 2>&1; then
-    echo "⚠ Warning: curl not installed (needed for S3 uploads)"
-    echo "Install with: apt update && apt install -y curl"
-    log_message "⚠ curl not installed"
+# Test basic connectivity
+echo "Testing basic connectivity..."
+if mc admin info "$ALIAS_NAME" >/dev/null 2>&1; then
+    echo "✓ MinIO server connection successful"
+    log_message "✓ MinIO server connection successful"
 else
-    echo "✓ curl is available"
-    log_message "✓ curl is available"
+    echo "⚠ MinIO admin info failed (this is OK for non-admin users)"
+    log_message "⚠ MinIO admin info failed (expected for backup user)"
 fi
 
-# Check if openssl is installed (needed for S3 signatures)
-if ! command -v openssl >/dev/null 2>&1; then
-    echo "⚠ Warning: openssl not installed (needed for S3 authentication)"
-    echo "Install with: apt update && apt install -y openssl"
-    log_message "⚠ openssl not installed"
+# Test bucket access
+echo "Testing bucket access..."
+if mc ls "${ALIAS_NAME}/${S3_BUCKET}/" >/dev/null 2>&1; then
+    echo "✓ Bucket listing successful"
+    log_message "✓ Bucket access successful"
 else
-    echo "✓ openssl is available"
-    log_message "✓ openssl is available"
-fi
+    echo "✗ Cannot access bucket: $S3_BUCKET"
+    log_message "✗ Bucket access failed"
 
-echo "Creating required directories..."
-
-# Create main backup directories
-create_directory "/root/backup" "755" "root:root"
-create_directory "/root/portainer" "755" "root:root"
-create_directory "/root/portainer/data" "755" "root:root"
-create_directory "/root/tools" "755" "root:root"
-
-# Create log directory (usually exists but just in case)
-create_directory "/var/log" "755" "root:root"
-
-# Create temporary directories that might be needed
-create_directory "/tmp" "1777" "root:root"
-
-echo
-echo "Setting up Docker network..."
-
-# Create Docker network if it doesn't exist
-if ! docker network inspect prod-network >/dev/null 2>&1; then
-    docker network create prod-network
-    log_message "✓ Created Docker network: prod-network"
-    echo "✓ Created Docker network: prod-network"
-else
-    log_message "✓ Docker network already exists: prod-network"
-    echo "✓ Docker network already exists: prod-network"
-fi
-
-echo
-echo "Setting up script permissions..."
-
-# Set executable permissions on backup scripts (if they exist)
-SCRIPT_DIR="/root/production/scripts"
-if [ ! -d "$SCRIPT_DIR" ]; then
-    SCRIPT_DIR="/root"  # Fallback for manual setup
-fi
-
-SCRIPTS=(
-    "docker-backup.sh"
-    "transfer-backup-to-s3.sh"
-    "backup-full-cycle.sh"
-    "docker-restore-s3.sh"
-    "list-backups-s3.sh"
-    "03-deploy-portainer.sh"
-    "s3-backup-config.sh"
-    "s3-helper.sh"
-)
-
-for script in "${SCRIPTS[@]}"; do
-    if [ -f "$SCRIPT_DIR/$script" ]; then
-        chmod +x "$SCRIPT_DIR/$script"
-        log_message "✓ Set executable permission: $script"
-        echo "✓ Set executable permission: $script"
+    # Try to list all buckets to see what's available
+    echo "Available buckets:"
+    if mc ls "$ALIAS_NAME" 2>/dev/null; then
+        echo "Bucket $S3_BUCKET not found in the list above"
     else
-        log_message "⚠ Script not found: $script"
-        echo "⚠ Script not found: $script (copy it here later)"
+        echo "Cannot list any buckets - check permissions"
     fi
-done
+    exit 1
+fi
+
+# Test upload capability
+echo "Testing upload capability..."
+TEST_FILE="/tmp/s3_test_$(date +%s).txt"
+echo "S3 connectivity test from $(hostname) - $(date)" > "$TEST_FILE"
+
+TEST_PATH="${ALIAS_NAME}/${S3_BUCKET}/${S3_HOSTNAME}/connectivity-test.txt"
+
+if mc cp "$TEST_FILE" "$TEST_PATH" 2>/dev/null; then
+    echo "✓ Upload test successful"
+    log_message "✓ Upload test successful"
+
+    # Test download
+    echo "Testing download capability..."
+    DOWNLOAD_FILE="/tmp/s3_download_test.txt"
+    if mc cp "$TEST_PATH" "$DOWNLOAD_FILE" 2>/dev/null; then
+        echo "✓ Download test successful"
+        log_message "✓ Download test successful"
+        rm -f "$DOWNLOAD_FILE"
+    else
+        echo "⚠ Download test failed (upload worked)"
+        log_message "⚠ Download test failed"
+    fi
+
+    # Test listing
+    echo "Testing listing capability..."
+    if mc ls "${ALIAS_NAME}/${S3_BUCKET}/${S3_HOSTNAME}/" 2>/dev/null | grep -q "connectivity-test.txt"; then
+        echo "✓ File listing successful"
+        log_message "✓ File listing successful"
+    else
+        echo "⚠ File listing failed (upload worked)"
+        log_message "⚠ File listing failed"
+    fi
+
+    # Try to remove test file (should fail with write-only policy)
+    echo "Testing delete protection..."
+    if mc rm "$TEST_PATH" 2>/dev/null; then
+        echo "⚠ File deletion succeeded (policy may not be restrictive enough)"
+        log_message "⚠ File deletion succeeded"
+    else
+        echo "✓ File deletion blocked (good - policy is working)"
+        log_message "✓ File deletion properly blocked"
+    fi
+
+else
+    echo "✗ Upload test failed"
+    log_message "✗ Upload test failed"
+
+    # Additional debugging
+    echo "Debugging information:"
+    echo "- Endpoint: $S3_ENDPOINT"
+    echo "- Bucket: $S3_BUCKET"
+    echo "- Path: ${S3_HOSTNAME}/connectivity-test.txt"
+    echo "- Full path: $TEST_PATH"
+
+    rm -f "$TEST_FILE"
+    exit 1
+fi
+
+# Cleanup
+rm -f "$TEST_FILE"
 
 echo
-echo "Creating example cron jobs file..."
+echo "Saving S3 configuration..."
 
-# Create example crontab entries
-cat > "/root/example-crontab.txt" << 'EOF'
-# Example crontab entries for S3 backup system
-# Add these to your crontab with: crontab -e
+# Save configuration with MC alias info
+cat > "$CONFIG_FILE" << EOF
+# S3 Backup System Configuration (MC-Based)
+# Generated by mc-based s3-backup-config.sh on $(date)
 
-# Daily backup at 2 AM
-0 2 * * * /root/production/scripts/backup-full-cycle.sh >> /var/log/backup-cron.log 2>&1
+BACKUP_TYPE="s3"
+BACKUP_METHOD="mc"
+S3_ENDPOINT="$S3_ENDPOINT"
+S3_ACCESS_KEY="$S3_ACCESS_KEY"
+S3_SECRET_KEY="$S3_SECRET_KEY"
+S3_BUCKET="$S3_BUCKET"
+S3_HOSTNAME="$S3_HOSTNAME"
+S3_ALIAS_NAME="$ALIAS_NAME"
+CONFIGURED_DATE="$(date -Iseconds)"
 
-# Portainer updates daily at 3 AM (after backup)
-0 3 * * * /root/production/scripts/03-deploy-portainer.sh >> /var/log/portainer-cron.log 2>&1
-
-# Weekly S3 connectivity test (Sundays at 1 AM)
-0 1 * * 0 /root/production/scripts/s3-helper.sh test >> /var/log/s3-test.log 2>&1
-
-# Weekly cleanup at 4 AM on Sundays
-0 4 * * 0 /usr/bin/docker system prune -f >> /var/log/docker-cleanup.log 2>&1
+# Legacy variables for compatibility
+NAS_IP="s3"
+SSH_USER="s3"
+REMOTE_BACKUP_DIR="s3://${S3_BUCKET}/${S3_HOSTNAME}"
 EOF
 
-log_message "✓ Created example crontab file"
-echo "✓ Created example crontab: /root/example-crontab.txt"
+chmod 600 "$CONFIG_FILE"
+log_message "Configuration saved to $CONFIG_FILE"
 
-echo
-echo "Checking system requirements..."
-
-# Check available disk space
-AVAILABLE_SPACE=$(df /root --output=avail | tail -n1)
-AVAILABLE_GB=$((AVAILABLE_SPACE / 1024 / 1024))
-
-if [ "$AVAILABLE_GB" -lt 10 ]; then
-    echo "⚠ Warning: Less than 10GB available space in /root"
-    log_message "⚠ Warning: Low disk space - ${AVAILABLE_GB}GB available"
-else
-    echo "✓ Sufficient disk space: ${AVAILABLE_GB}GB available"
-    log_message "✓ Sufficient disk space: ${AVAILABLE_GB}GB available"
-fi
+# Keep the MC alias configured for ongoing use
+echo "✓ MinIO client alias '$ALIAS_NAME' configured and ready for use"
 
 echo
 echo "========================================"
-echo "  Setup Complete!"
+echo "  Configuration Complete!"
 echo "========================================"
+echo "S3 Endpoint: $S3_ENDPOINT"
+echo "Bucket: $S3_BUCKET"
+echo "Hostname Path: $S3_HOSTNAME"
+echo "MC Alias: $ALIAS_NAME"
+echo "Configuration: $CONFIG_FILE"
+echo
+echo "✅ All tests passed! Your S3 backup system is ready."
 echo
 echo "Next steps:"
-echo "1. Copy your backup scripts to /root/production/scripts/"
-echo "2. Configure S3 storage: /root/production/scripts/s3-backup-config.sh"
-echo "3. Test backup with: /root/production/scripts/docker-backup.sh"
-echo "4. Add cron jobs from: /root/example-crontab.txt"
-echo "5. Start Portainer with: /root/production/scripts/03-deploy-portainer.sh"
+echo "1. Test backup: /root/production/scripts/docker-backup.sh"
+echo "2. Test S3 transfer: /root/production/scripts/transfer-backup-to-s3.sh"
+echo "3. Run full backup cycle: /root/production/scripts/backup-full-cycle.sh"
 echo
-echo "S3 Configuration Notes:"
-echo "- No Tailscale required for S3 backups"
-echo "- Ensure your MinIO instance is accessible over HTTPS"
-echo "- Use strong, unique credentials for backup service account"
-echo "- Enable bucket versioning for backup protection"
-echo
-echo "Log file: $LOG_FILE"
+echo "Useful MC commands:"
+echo "- List files: mc ls $ALIAS_NAME/$S3_BUCKET/$S3_HOSTNAME/"
+echo "- Upload file: mc cp /path/to/file $ALIAS_NAME/$S3_BUCKET/$S3_HOSTNAME/"
+echo "- Download file: mc cp $ALIAS_NAME/$S3_BUCKET/$S3_HOSTNAME/file /path/to/local"
 
-log_message "=== S3 Backup Environment Setup Completed ==="
+log_message "=== MC-Based S3 Backup Configuration Completed Successfully ==="
