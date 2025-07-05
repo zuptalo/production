@@ -399,7 +399,8 @@ test_cron_setup() {
 
     echo "Installed Local Docker Backup System cron jobs:"
     if crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" | grep -E "(backup|docker)"; then
-        local job_count=$(crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" | grep -E "(backup|docker)" | wc -l)
+        local job_count
+        job_count=$(crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" | grep -E "(backup|docker)" | wc -l)
         echo "✓ Found $job_count backup system cron jobs"
     else
         log_message "⚠ No backup system cron jobs found"
@@ -617,9 +618,33 @@ create_remote_download_script() {
     local private_key="$backup_user_home/.ssh/id_ed25519"
     local download_script="/root/download-backups-from-server.sh"
 
-    # Get server IP/hostname
+    # Get server IP/hostname - try multiple methods for best result
     local server_ip
-    server_ip=$(hostname -I | awk '{print $1}' || echo "YOUR_SERVER_IP")
+
+    # Method 1: Try to get public IP first
+    server_ip=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s --connect-timeout 5 ipinfo.io/ip 2>/dev/null || echo "")
+
+    # Method 2: If no public IP, try hostname
+    if [ -z "$server_ip" ]; then
+        server_ip=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
+    fi
+
+    # Method 3: Fallback to first non-loopback IP
+    if [ -z "$server_ip" ] || [[ "$server_ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+        # If we got a private IP or nothing, try to get a better one
+        local fallback_ip
+        fallback_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "YOUR_SERVER_IP")
+
+        # Only use fallback if we have nothing better
+        if [ -z "$server_ip" ]; then
+            server_ip="$fallback_ip"
+        fi
+    fi
+
+    # Final fallback
+    if [ -z "$server_ip" ]; then
+        server_ip="YOUR_SERVER_IP"
+    fi
 
     # Read the private key content
     if [ ! -f "$private_key" ]; then
@@ -642,11 +667,18 @@ create_remote_download_script() {
 set -euo pipefail
 
 # Configuration - EDIT THESE VARIABLES
-DOWNLOAD_PATH="/volume1/backup/zuptalo"    # Local path to download backups
-SERVER_IP="$server_ip"                     # Server IP address
-SERVER_USER="backup-reader"                # Backup user on server
-KEEP_LAST_N=3                              # How many recent backups to download
-KEEP_LOCAL_BACKUPS=30                      # How many backups to keep locally (cleanup older ones)
+DOWNLOAD_PATH="/tmp/server-backups"          # Local path to download backups
+SERVER_IP="$server_ip"                       # Server IP address (AUTO-DETECTED - VERIFY THIS!)
+SERVER_USER="backup-reader"                  # Backup user on server
+KEEP_LAST_N=3                               # How many recent backups to download
+KEEP_LOCAL_BACKUPS=30                       # How many backups to keep locally (cleanup older ones)
+
+# ⚠️  IMPORTANT: Verify SERVER_IP above is correct!
+# If this is a private IP (10.x.x.x, 192.168.x.x, 172.16-31.x.x),
+# replace it with your public IP or domain name.
+# Examples:
+#   SERVER_IP="your-domain.com"
+#   SERVER_IP="1.2.3.4"  # Your public IP
 
 # SSH key embedded in script (base64 encoded for safety)
 SSH_KEY_B64="\$(base64 -w0 << 'EOF_KEY'
@@ -976,6 +1008,20 @@ EOF
 
     log_message "✓ Created remote download script: $download_script"
     echo "✓ Created remote download script: $download_script"
+
+    # Show warning about IP detection
+    if [[ "$server_ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+        echo "⚠️  WARNING: Detected private IP ($server_ip) in download script"
+        echo "   Edit the script and replace SERVER_IP with your public IP or domain name"
+        log_message "⚠ Private IP detected in script: $server_ip"
+    elif [ "$server_ip" = "YOUR_SERVER_IP" ]; then
+        echo "⚠️  WARNING: Could not auto-detect server IP"
+        echo "   Edit the script and set SERVER_IP to your public IP or domain name"
+        log_message "⚠ Could not auto-detect server IP"
+    else
+        echo "✓ Auto-detected server IP: $server_ip"
+        log_message "✓ Auto-detected server IP: $server_ip"
+    fi
 
     # Create a user-friendly copy in /home/backup-reader for easy distribution
     local user_script="$backup_user_home/download-backups.sh"
