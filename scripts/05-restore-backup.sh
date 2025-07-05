@@ -1,32 +1,15 @@
 #!/bin/bash
 
-# Docker Infrastructure Restore Script
-# This script safely restores from local or remote backups with container management
+# Docker Infrastructure Restore Script - Local Only
+# This script safely restores from local backups with container management
 
 set -euo pipefail
 
 # Configuration
 BACKUP_BASE_DIR="/root/backup"
-CONFIG_FILE="/root/.backup-config"
-
-# Load configuration if it exists
-if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-else
-    # Fallback to default values
-    NAS_IP="${NAS_IP:-YOUR_NAS_IP}"
-    SSH_USER="${SSH_USER:-backup-user}"
-    REMOTE_BACKUP_DIR="${REMOTE_BACKUP_DIR:-/volume1/backup/$(hostname)}"
-    echo "⚠ No configuration file found. Using defaults. Run 02-tailscale-discovery.sh first."
-fi
-
 LOG_FILE="/var/log/docker-restore.log"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CONTAINER_STATE_FILE="/tmp/restore_container_states_${TIMESTAMP}.txt"
-
-# SSH options for remote access
-SSH_OPTS="-i /root/.ssh/backup_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes"
 
 # Function to log messages
 log_message() {
@@ -37,6 +20,7 @@ log_message() {
 show_header() {
     echo "========================================"
     echo "  Docker Infrastructure Restore Tool"
+    echo "  (Local Backups Only)"
     echo "========================================"
     echo
 }
@@ -65,12 +49,10 @@ stop_all_containers() {
         # Stop containers one by one for better error handling
         echo "$running_containers" | while read -r container_id; do
             if [ -n "$container_id" ]; then
-                # Fixed: Better container name extraction
                 local container_name
                 container_name=$(docker inspect "$container_id" --format '{{.Name}}' 2>/dev/null | sed 's|^/||' || echo "unknown")
                 echo "Stopping container: $container_name ($container_id)"
 
-                # Fixed: Use --timeout instead of deprecated --time
                 if docker stop "$container_id" --timeout 30 2>/dev/null; then
                     log_message "✓ Stopped: $container_name ($container_id)"
                     echo "✓ Stopped: $container_name"
@@ -146,108 +128,6 @@ list_local_backups() {
     for backup in "${backups[@]}"; do
         echo "BACKUP:$backup"
     done
-}
-
-# Function to list remote backups - FIXED VERSION
-list_remote_backups() {
-    echo "Remote Backups Available:"
-    echo "-------------------------"
-
-    # Test SSH connection
-    if ! ssh $SSH_OPTS "$SSH_USER@$NAS_IP" "exit" 2>/dev/null; then
-        echo "✗ Cannot connect to NAS"
-        return 1
-    fi
-
-    echo "✓ SSH connection successful"
-
-    # Get remote backup list
-    local remote_list
-    remote_list=$(ssh $SSH_OPTS "$SSH_USER@$NAS_IP" "find '$REMOTE_BACKUP_DIR' -maxdepth 1 -type d -name '[0-9]*_[0-9]*' | sort -r" 2>/dev/null)
-
-    if [ -z "$remote_list" ]; then
-        echo "No remote backups found in $REMOTE_BACKUP_DIR"
-        echo "COUNT:0"
-        return 0
-    fi
-
-    local backups=()
-    local counter=1
-
-    # Process each backup using array approach (which we know works from testing)
-    IFS=$'\n' read -d '' -r -a backup_array <<< "$remote_list"
-
-    for backup_path in "${backup_array[@]}"; do
-        if [ -n "$backup_path" ] && [ "$backup_path" != "$REMOTE_BACKUP_DIR" ]; then
-            local backup_name
-            backup_name=$(basename "$backup_path")
-
-            # Validate backup directory name format
-            if [[ "$backup_name" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
-                # Get size
-                local backup_size
-                backup_size=$(ssh $SSH_OPTS "$SSH_USER@$NAS_IP" "du -sh '$backup_path' 2>/dev/null | cut -f1" 2>/dev/null || echo "Unknown")
-
-                # Format date and time
-                local backup_date
-                backup_date=$(date -d "${backup_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
-                local backup_time="${backup_name:9:2}:${backup_name:11:2}:${backup_name:13:2}"
-
-                backups+=("$backup_path")
-                printf "%2d) %s (%s) - %s %s\n" "$counter" "$backup_name" "$backup_size" "$backup_date" "$backup_time"
-                ((counter++))
-            fi
-        fi
-    done
-
-    # Return count and backup list
-    echo "COUNT:${#backups[@]}"
-    for backup in "${backups[@]}"; do
-        echo "BACKUP:$backup"
-    done
-}
-
-# Function to download remote backup
-download_remote_backup() {
-    local remote_backup_path="$1"
-    local backup_name
-    backup_name=$(basename "$remote_backup_path")
-    local local_temp_dir="/tmp/restore_${backup_name}"
-
-    log_message "Downloading remote backup: $backup_name"
-    echo "Downloading backup from NAS..." >&2
-    echo "Source: $SSH_USER@$NAS_IP:$remote_backup_path/" >&2
-    echo "Destination: $local_temp_dir/" >&2
-
-    # Create temporary directory
-    mkdir -p "$local_temp_dir"
-
-    # Download backup files using rsync
-    echo "Starting rsync transfer..." >&2
-    if rsync -avz --progress \
-        -e "ssh $SSH_OPTS" \
-        "$SSH_USER@$NAS_IP:$remote_backup_path/" \
-        "$local_temp_dir/" >&2 2>&1; then
-
-        log_message "✓ Remote backup downloaded successfully"
-        echo "✓ Download completed" >&2
-
-        # Verify files were downloaded
-        local file_count
-        file_count=$(find "$local_temp_dir" -type f | wc -l)
-        echo "Downloaded $file_count files to $local_temp_dir" >&2
-        log_message "Downloaded $file_count files"
-
-        # ONLY output the directory path to stdout for capture
-        echo "$local_temp_dir"
-    else
-        log_message "✗ Failed to download remote backup"
-        echo "✗ Download failed" >&2
-        echo "Debug: Checking if temp directory exists..." >&2
-        ls -la "$local_temp_dir" >&2 2>/dev/null || echo "Temp directory doesn't exist" >&2
-        rm -rf "$local_temp_dir"
-        return 1
-    fi
 }
 
 # Function to verify backup integrity
@@ -390,7 +270,7 @@ restore_ownership_from_metadata() {
 
     if [ -f "$restore_script" ] && [ -x "$restore_script" ]; then
         echo "Applying ownership restoration from backup metadata..."
-        log_message "Executing generic ownership restoration"
+        log_message "Executing ownership restoration"
 
         if "$restore_script"; then
             echo "✓ Ownership restored from backup metadata"
@@ -403,13 +283,6 @@ restore_ownership_from_metadata() {
         echo "No ownership restoration data available in this backup"
         log_message "No ownership restoration script found"
     fi
-}
-
-# Function to cleanup temporary files
-cleanup_temp_files() {
-    # Remove any temporary download directories
-    find /tmp -maxdepth 1 -name "restore_[0-9]*_[0-9]*" -type d -mmin +60 -exec rm -rf {} \; 2>/dev/null || true
-    log_message "Cleaned up temporary files"
 }
 
 # Main restore function
@@ -425,106 +298,48 @@ main() {
     fi
 
     # Trap to ensure containers are restarted even if script fails
-    trap 'log_message "Script interrupted - attempting to restart containers..."; start_containers; cleanup_temp_files; exit 1' INT TERM
+    trap 'log_message "Script interrupted - attempting to restart containers..."; start_containers; exit 1' INT TERM
 
-    echo "Select backup source:"
-    echo "1) Local backups"
-    echo "2) Remote backups (NAS)"
+    echo "Local backup restoration:"
     echo
-    read -p "Enter choice (1-2): " source_choice
 
-    local backup_dir=""
-    local is_remote=false
+    # List local backups and get selection
+    local local_output
+    local_output=$(list_local_backups)
 
-    case $source_choice in
-        1)
-            echo
-            # List local backups and get selection
-            local local_output
-            local_output=$(list_local_backups)
+    # Display the output (everything except COUNT: and BACKUP: lines)
+    echo "$local_output" | grep -v "^COUNT:" | grep -v "^BACKUP:"
 
-            # Display the output (everything except COUNT: and BACKUP: lines)
-            echo "$local_output" | grep -v "^COUNT:" | grep -v "^BACKUP:"
+    # Parse the output to get count and backup list
+    local backup_count=0
+    local backup_list=()
 
-            # Parse the output to get count and backup list
-            local backup_count=0
-            local backup_list=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^COUNT:([0-9]+)$ ]]; then
+            backup_count="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^BACKUP:(.+)$ ]]; then
+            backup_list+=("${BASH_REMATCH[1]}")
+        fi
+    done <<< "$local_output"
 
-            while IFS= read -r line; do
-                if [[ "$line" =~ ^COUNT:([0-9]+)$ ]]; then
-                    backup_count="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^BACKUP:(.+)$ ]]; then
-                    backup_list+=("${BASH_REMATCH[1]}")
-                fi
-            done <<< "$local_output"
+    if [ "$backup_count" -eq 0 ]; then
+        echo "No local backups found."
+        echo "Run 'backup-now' to create a backup first."
+        exit 1
+    fi
 
-            if [ "$backup_count" -eq 0 ]; then
-                echo "No local backups found."
-                exit 1
-            fi
+    echo
+    read -p "Enter backup number to restore (1-$backup_count): " backup_choice
 
-            echo
-            read -p "Enter backup number to restore (1-$backup_count): " backup_choice
-
-            if [[ "$backup_choice" =~ ^[0-9]+$ ]] && [ "$backup_choice" -ge 1 ] && [ "$backup_choice" -le "$backup_count" ]; then
-                backup_dir="${backup_list[$((backup_choice-1))]}"
-            else
-                echo "Invalid selection"
-                exit 1
-            fi
-            ;;
-        2)
-            echo
-            # List remote backups and get selection
-            local remote_output
-            remote_output=$(list_remote_backups)
-
-            # Check if listing was successful
-            if [ $? -ne 0 ]; then
-                echo "Failed to list remote backups"
-                exit 1
-            fi
-
-            # Display the output (everything except COUNT: and BACKUP: lines)
-            echo "$remote_output" | grep -v "^COUNT:" | grep -v "^BACKUP:"
-
-            # Parse the output to get count and backup list
-            local backup_count=0
-            local backup_list=()
-
-            while IFS= read -r line; do
-                if [[ "$line" =~ ^COUNT:([0-9]+)$ ]]; then
-                    backup_count="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^BACKUP:(.+)$ ]]; then
-                    backup_list+=("${BASH_REMATCH[1]}")
-                fi
-            done <<< "$remote_output"
-
-            if [ "$backup_count" -eq 0 ]; then
-                echo "No remote backups found."
-                exit 1
-            fi
-
-            echo
-            read -p "Enter backup number to restore (1-$backup_count): " backup_choice
-
-            if [[ "$backup_choice" =~ ^[0-9]+$ ]] && [ "$backup_choice" -ge 1 ] && [ "$backup_choice" -le "$backup_count" ]; then
-                local remote_backup_path="${backup_list[$((backup_choice-1))]}"
-                backup_dir=$(download_remote_backup "$remote_backup_path")
-                is_remote=true
-            else
-                echo "Invalid selection"
-                exit 1
-            fi
-            ;;
-        *)
-            echo "Invalid choice"
-            exit 1
-            ;;
-    esac
+    if [[ "$backup_choice" =~ ^[0-9]+$ ]] && [ "$backup_choice" -ge 1 ] && [ "$backup_choice" -le "$backup_count" ]; then
+        local backup_dir="${backup_list[$((backup_choice-1))]}"
+    else
+        echo "Invalid selection"
+        exit 1
+    fi
 
     if [ ! -d "$backup_dir" ]; then
-        echo "Backup directory not found or download failed"
+        echo "Backup directory not found"
         exit 1
     fi
 
@@ -552,9 +367,6 @@ main() {
 
     if [ "$confirm" != "yes" ]; then
         echo "Restore cancelled"
-        if [ "$is_remote" = true ]; then
-            rm -rf "$backup_dir"
-        fi
         exit 0
     fi
 
@@ -580,13 +392,6 @@ main() {
     # Restart containers
     start_containers
 
-    # Cleanup
-    if [ "$is_remote" = true ]; then
-        echo "Cleaning up downloaded backup: $backup_dir"
-        rm -rf "$backup_dir"
-    fi
-    cleanup_temp_files
-
     echo
     echo "========================================"
     echo "  Restore Completed Successfully!"
@@ -598,6 +403,41 @@ main() {
 
     log_message "=== Restore Completed Successfully ==="
 }
+
+# Show help if requested
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    echo "Docker Infrastructure Restore Script - Local Only"
+    echo
+    echo "Restores Docker infrastructure from local backups with:"
+    echo "- Interactive backup selection"
+    echo "- Graceful container management"
+    echo "- Safety backup of current data"
+    echo "- Backup integrity verification"
+    echo "- Ownership and permission restoration"
+    echo
+    echo "Usage: $0"
+    echo
+    echo "Process:"
+    echo "1. Lists available local backups"
+    echo "2. Verifies backup integrity"
+    echo "3. Creates safety backup of current data"
+    echo "4. Stops containers gracefully"
+    echo "5. Restores data from selected backup"
+    echo "6. Restarts containers"
+    echo
+    echo "Data locations:"
+    echo "- Backups: /root/backup/"
+    echo "- Current data moved to: .old directories"
+    echo "- Safety backup: /tmp/pre_restore_backup_*"
+    echo "- Log file: /var/log/docker-restore.log"
+    exit 0
+fi
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "✗ This script must be run as root"
+    exit 1
+fi
 
 # Run main function
 main "$@"

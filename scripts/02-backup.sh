@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Docker Infrastructure Backup Script
-# This script creates consistent backups by stopping containers, creating tar archives, and restoring container states
+# Docker Infrastructure Backup Script - Local Only
+# Creates consistent backups by stopping containers, creating tar archives, and restoring container states
 
 set -euo pipefail
 
@@ -171,7 +171,7 @@ RESTORE_SCRIPT
 
 # Function to cleanup old backups (keep last N backups)
 cleanup_old_backups() {
-    local keep_count=3
+    local keep_count=5
     local backup_count
 
     log_message "Cleaning up old backups (keeping last $keep_count)..."
@@ -274,7 +274,40 @@ main() {
     # Create latest symlink
     ln -sfn "$BACKUP_DIR" "${BACKUP_BASE_DIR}/latest"
     log_message "Latest backup symlink updated"
+
+    echo
+    echo "========================================"
+    echo "  Backup Complete!"
+    echo "========================================"
+    echo "Location: $BACKUP_DIR"
+    echo "Size: $total_size"
+    echo "Latest symlink: ${BACKUP_BASE_DIR}/latest"
+    echo
 }
+
+# Show help if requested
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    echo "Docker Infrastructure Backup Script - Local Only"
+    echo
+    echo "Creates local backups of Docker infrastructure including:"
+    echo "- Portainer data (/root/portainer)"
+    echo "- Application data (/root/tools)"
+    echo "- System configuration files"
+    echo
+    echo "Usage: $0"
+    echo
+    echo "Features:"
+    echo "- Graceful container stop/start"
+    echo "- Compressed tar archives with checksums"
+    echo "- Automatic cleanup of old backups (keeps 5)"
+    echo "- Complete ownership and permission preservation"
+    echo
+    echo "Output:"
+    echo "- Backup directory: /root/backup/YYYYMMDD_HHMMSS/"
+    echo "- Log file: /var/log/docker-backup.log"
+    echo "- Latest symlink: /root/backup/latest"
+    exit 0
+fi
 
 # Run main function
 main "$@"
