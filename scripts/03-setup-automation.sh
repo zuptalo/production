@@ -181,12 +181,22 @@ echo
 echo "💾 Recent Backups:"
 if [ -d "/root/backup" ]; then
     echo "   Local backups:"
-    ls -la /root/backup/ | grep "^d" | grep "[0-9]" | tail -3 | while read -r line; do
-        echo "     $line"
+    find /root/backup -maxdepth 1 -type d -name "[0-9]*_[0-9]*" | sort -r | head -3 | while read -r backup_dir; do
+        if [ -n "$backup_dir" ]; then
+            backup_name=$(basename "$backup_dir")
+            backup_size=$(du -sh "$backup_dir" 2>/dev/null | cut -f1)
+            backup_date=$(date -d "${backup_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
+            backup_time="${backup_name:9:2}:${backup_name:11:2}:${backup_name:13:2}"
+            echo "     📦 $backup_name ($backup_size) - $backup_date $backup_time"
+        fi
     done
 
     if [ -L "/root/backup/latest" ]; then
-        echo "   Latest backup: $(readlink /root/backup/latest) ($(du -sh /root/backup/latest | cut -f1))"
+        latest_target=$(readlink /root/backup/latest)
+        latest_size=$(du -sh /root/backup/latest 2>/dev/null | cut -f1)
+        echo "   Latest backup: $(basename "$latest_target") ($latest_size)"
+    else
+        echo "   ⚠ No 'latest' symlink found"
     fi
 else
     echo "   ✗ No backup directory found"
@@ -197,7 +207,7 @@ echo
 echo "📋 Recent Log Status:"
 for log in backup-cron.log docker-cleanup.log; do
     if [ -f "/var/log/$log" ]; then
-        local errors=$(tail -50 "/var/log/$log" 2>/dev/null | grep -i "error\|failed\|✗" | wc -l)
+        errors=$(tail -50 "/var/log/$log" 2>/dev/null | grep -i "error\|failed\|✗" | wc -l)
         if [ "$errors" -eq 0 ]; then
             echo "   ✓ $log: No recent errors"
         else
@@ -211,16 +221,22 @@ echo
 
 # Check disk space
 echo "💿 Disk Space:"
-df -h /root | tail -1 | while read -r filesystem size used avail percent mount; do
-    echo "   Root partition: $used/$size used ($percent)"
-done
+disk_info=$(df -h /root | tail -1)
+filesystem=$(echo "$disk_info" | awk '{print $1}')
+size=$(echo "$disk_info" | awk '{print $2}')
+used=$(echo "$disk_info" | awk '{print $3}')
+avail=$(echo "$disk_info" | awk '{print $4}')
+percent=$(echo "$disk_info" | awk '{print $5}')
+echo "   Root partition: $used/$size used ($percent) - $avail available"
 echo
 
 # Check Docker status
 echo "🐳 Docker Status:"
 if docker info >/dev/null 2>&1; then
     echo "   ✓ Docker running"
-    echo "   Containers: $(docker ps -q | wc -l) running, $(docker ps -aq | wc -l) total"
+    running_containers=$(docker ps -q | wc -l)
+    total_containers=$(docker ps -aq | wc -l)
+    echo "   Containers: $running_containers running, $total_containers total"
 else
     echo "   ✗ Docker not running"
 fi
@@ -230,12 +246,22 @@ echo
 echo "⏰ Cron Status:"
 if systemctl is-active --quiet cron || systemctl is-active --quiet crond; then
     echo "   ✓ Cron service running"
-    local cron_jobs=$(crontab -l 2>/dev/null | grep -c "02-backup.sh" || echo "0")
+    cron_jobs=$(crontab -l 2>/dev/null | grep -c "02-backup.sh" || echo "0")
     echo "   Backup jobs: $cron_jobs configured"
 else
     echo "   ✗ Cron service not running"
 fi
 echo
+
+# Check backup directory usage
+if [ -d "/root/backup" ]; then
+    echo "💾 Backup Summary:"
+    backup_count=$(find /root/backup -maxdepth 1 -type d -name "[0-9]*_[0-9]*" | wc -l)
+    total_backup_size=$(du -sh /root/backup 2>/dev/null | cut -f1)
+    echo "   Total backups: $backup_count"
+    echo "   Total backup size: $total_backup_size"
+    echo
+fi
 
 echo "========================================"
 EOF
