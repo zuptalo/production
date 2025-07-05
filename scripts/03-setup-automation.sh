@@ -512,6 +512,11 @@ show_next_steps() {
     echo "  • logs-backup       - View backup logs"
     echo "  • logs-cron         - View cron execution logs"
     echo
+    echo "🔗 Remote Access:"
+    echo "  • Download script: /root/download-backups-from-server.sh"
+    echo "  • User copy: /home/backup-reader/download-backups.sh"
+    echo "  • Backup user: backup-reader (SSH access with restrictions)"
+    echo
     echo "📅 Automated Schedule:"
     echo "  • Daily 2:00 AM     - Local backup"
     echo "  • Daily 6:00 AM     - Health checks"
@@ -530,7 +535,458 @@ show_next_steps() {
     echo
 }
 
-# Function to create final verification
+# Function to create backup user with SSH access
+create_backup_user() {
+    log_message "Creating backup user with limited SSH access..."
+
+    local backup_user="backup-reader"
+    local backup_user_home="/home/$backup_user"
+
+    # Create user if it doesn't exist
+    if ! id "$backup_user" >/dev/null 2>&1; then
+        useradd -m -s /bin/bash "$backup_user"
+        log_message "✓ Created user: $backup_user"
+        echo "✓ Created backup user: $backup_user"
+    else
+        log_message "✓ User already exists: $backup_user"
+        echo "✓ Backup user already exists: $backup_user"
+    fi
+
+    # Create SSH directory
+    mkdir -p "$backup_user_home/.ssh"
+    chown "$backup_user:$backup_user" "$backup_user_home/.ssh"
+    chmod 700 "$backup_user_home/.ssh"
+
+    # Generate SSH key pair for the backup user
+    local private_key="$backup_user_home/.ssh/id_ed25519"
+    local public_key="$backup_user_home/.ssh/id_ed25519.pub"
+
+    if [ ! -f "$private_key" ]; then
+        echo "Generating Ed25519 SSH key pair for backup user..."
+        sudo -u "$backup_user" ssh-keygen -t ed25519 -f "$private_key" -N "" -C "backup-reader@$(hostname)"
+        log_message "✓ Generated Ed25519 SSH key pair for $backup_user"
+        echo "✓ Generated Ed25519 SSH key pair"
+    else
+        log_message "✓ Ed25519 SSH key pair already exists for $backup_user"
+        echo "✓ Ed25519 SSH key pair already exists"
+    fi
+
+    # Add public key to authorized_keys
+    local authorized_keys="$backup_user_home/.ssh/authorized_keys"
+
+    # Create authorized_keys with restricted command
+    cat > "$authorized_keys" << EOF
+# Restricted SSH access for backup downloading
+command="bash -c 'case \"\$SSH_ORIGINAL_COMMAND\" in
+  \"ls /root/backup\"*) ls /root/backup/ ;;
+  \"find /root/backup\"*) find /root/backup -type f -name \"*.tar.gz\" -o -name \"*.json\" -o -name \"*.txt\" -o -name \"*.sha256\" ;;
+  \"du -sh /root/backup\"*) du -sh /root/backup/* ;;
+  \"cat /root/backup/\"*\"/backup_metadata.json\") cat \"\$SSH_ORIGINAL_COMMAND\" | cut -d\" \" -f2- ;;
+  \"tar -tzf /root/backup/\"*) eval \"\$SSH_ORIGINAL_COMMAND\" ;;
+  \"rsync --server -vlogDtpre.iLsfxC . /root/backup/\"*) eval \"\$SSH_ORIGINAL_COMMAND\" ;;
+  *) echo \"Command not allowed: \$SSH_ORIGINAL_COMMAND\" >&2; exit 1 ;;
+esac'",no-port-forwarding,no-X11-forwarding,no-agent-forwarding $(cat "$public_key")
+EOF
+
+    chown "$backup_user:$backup_user" "$authorized_keys"
+    chmod 600 "$authorized_keys"
+
+    log_message "✓ Configured restricted SSH access for $backup_user"
+    echo "✓ Configured restricted SSH access"
+
+    # Add backup user to backup group (if needed for read access)
+    if ! groups "$backup_user" | grep -q "backup"; then
+        groupadd -f backup
+        usermod -a -G backup "$backup_user"
+        # Give backup group read access to backup directory
+        chgrp -R backup /root/backup 2>/dev/null || true
+        chmod -R g+r /root/backup 2>/dev/null || true
+        log_message "✓ Added $backup_user to backup group"
+    fi
+
+    echo "✓ Backup user setup completed"
+    return 0
+}
+
+# Function to create remote backup download script
+create_remote_download_script() {
+    log_message "Creating remote backup download script..."
+
+    local backup_user="backup-reader"
+    local backup_user_home="/home/$backup_user"
+    local private_key="$backup_user_home/.ssh/id_ed25519"
+    local download_script="/root/download-backups-from-server.sh"
+
+    # Get server IP/hostname
+    local server_ip
+    server_ip=$(hostname -I | awk '{print $1}' || echo "YOUR_SERVER_IP")
+
+    # Read the private key content
+    if [ ! -f "$private_key" ]; then
+        log_message "✗ Private key not found: $private_key"
+        echo "✗ Cannot create download script - private key missing"
+        return 1
+    fi
+
+    local private_key_content
+    private_key_content=$(cat "$private_key")
+
+    # Create the download script
+    cat > "$download_script" << EOF
+#!/bin/bash
+
+# Remote Backup Download Script
+# Downloads backups from server to local machine
+# Generated on $(date) for server: $(hostname)
+
+set -euo pipefail
+
+# Configuration - EDIT THESE VARIABLES
+DOWNLOAD_PATH="/volume1/backup/zuptalo"    # Local path to download backups
+SERVER_IP="$server_ip"                     # Server IP address
+SERVER_USER="backup-reader"                # Backup user on server
+KEEP_LAST_N=3                              # How many recent backups to download
+KEEP_LOCAL_BACKUPS=30                      # How many backups to keep locally (cleanup older ones)
+
+# SSH key embedded in script (base64 encoded for safety)
+SSH_KEY_B64="\$(base64 -w0 << 'EOF_KEY'
+$private_key_content
+EOF_KEY
+)"
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log_info() {
+    echo -e "\${BLUE}[INFO]\${NC} \$1"
+}
+
+log_success() {
+    echo -e "\${GREEN}[SUCCESS]\${NC} \$1"
+}
+
+log_warning() {
+    echo -e "\${YELLOW}[WARNING]\${NC} \$1"
+}
+
+log_error() {
+    echo -e "\${RED}[ERROR]\${NC} \$1"
+}
+
+# Function to setup SSH key
+setup_ssh_key() {
+    local temp_key="\$(mktemp)"
+    echo "\$SSH_KEY_B64" | base64 -d > "\$temp_key"
+    chmod 600 "\$temp_key"
+    echo "\$temp_key"
+}
+
+# Function to cleanup temporary files
+cleanup() {
+    if [ -n "\${TEMP_SSH_KEY:-}" ] && [ -f "\$TEMP_SSH_KEY" ]; then
+        rm -f "\$TEMP_SSH_KEY"
+    fi
+}
+
+# Function to test connection
+test_connection() {
+    local ssh_key="\$1"
+
+    log_info "Testing connection to \$SERVER_USER@\$SERVER_IP..."
+
+    if ssh -i "\$ssh_key" -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "\$SERVER_USER@\$SERVER_IP" "ls /root/backup" >/dev/null 2>&1; then
+        log_success "Connection successful"
+        return 0
+    else
+        log_error "Connection failed"
+        return 1
+    fi
+}
+
+# Function to list remote backups
+list_remote_backups() {
+    local ssh_key="\$1"
+
+    log_info "Listing available backups on server..."
+
+    ssh -i "\$ssh_key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "\$SERVER_USER@\$SERVER_IP" "find /root/backup -maxdepth 1 -type d -name '[0-9]*_[0-9]*' | sort -r"
+}
+
+# Function to get backup metadata
+get_backup_metadata() {
+    local ssh_key="\$1"
+    local backup_path="\$2"
+
+    ssh -i "\$ssh_key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "\$SERVER_USER@\$SERVER_IP" "cat \$backup_path/backup_metadata.json" 2>/dev/null || echo "{}"
+}
+
+# Function to cleanup old local backups
+cleanup_old_backups() {
+    log_info "Cleaning up old local backups (keeping last \$KEEP_LOCAL_BACKUPS)..."
+
+    if [ ! -d "\$DOWNLOAD_PATH" ]; then
+        return 0
+    fi
+
+    # Find all backup directories and count them
+    local backup_dirs
+    backup_dirs=\$(find "\$DOWNLOAD_PATH" -maxdepth 1 -type d -name '[0-9]*_[0-9]*' | sort)
+    local backup_count
+    backup_count=\$(echo "\$backup_dirs" | grep -c '^' || echo 0)
+
+    if [ "\$backup_count" -le "\$KEEP_LOCAL_BACKUPS" ]; then
+        log_info "Only \$backup_count backups found, no cleanup needed"
+        return 0
+    fi
+
+    # Calculate how many to remove
+    local remove_count=\$((backup_count - KEEP_LOCAL_BACKUPS))
+    log_info "Found \$backup_count backups, removing oldest \$remove_count"
+
+    # Remove oldest backups
+    echo "\$backup_dirs" | head -n "\$remove_count" | while read -r old_backup; do
+        if [ -n "\$old_backup" ] && [ -d "\$old_backup" ]; then
+            local backup_name=\$(basename "\$old_backup")
+            local backup_size=\$(du -sh "\$old_backup" 2>/dev/null | cut -f1)
+            log_info "Removing old backup: \$backup_name (\$backup_size)"
+            rm -rf "\$old_backup"
+        fi
+    done
+
+    # Show final count
+    local remaining_count
+    remaining_count=\$(find "\$DOWNLOAD_PATH" -maxdepth 1 -type d -name '[0-9]*_[0-9]*' | wc -l)
+    log_success "Cleanup completed. \$remaining_count backups remaining"
+}
+download_backup() {
+    local ssh_key="\$1"
+    local remote_backup_path="\$2"
+    local backup_name="\$3"
+    local local_backup_dir="\$DOWNLOAD_PATH/\$backup_name"
+
+    log_info "Downloading backup: \$backup_name"
+
+    # Create local directory
+    mkdir -p "\$local_backup_dir"
+
+    # Download using rsync
+    if rsync -avz --progress -e "ssh -i \$ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" "\$SERVER_USER@\$SERVER_IP:\$remote_backup_path/" "\$local_backup_dir/"; then
+        log_success "Downloaded: \$backup_name"
+
+        # Verify checksums if available
+        local checksum_files=\$(find "\$local_backup_dir" -name "*.sha256" | wc -l)
+        if [ "\$checksum_files" -gt 0 ]; then
+            log_info "Verifying checksums..."
+            cd "\$local_backup_dir"
+            if find . -name "*.sha256" -exec sha256sum -c {} \; >/dev/null 2>&1; then
+                log_success "All checksums verified"
+            else
+                log_warning "Some checksums failed verification"
+            fi
+            cd - >/dev/null
+        fi
+
+        return 0
+    else
+        log_error "Failed to download: \$backup_name"
+        return 1
+    fi
+}
+
+# Function to show usage
+show_usage() {
+    echo "Remote Backup Download Script"
+    echo
+    echo "Usage: \$0 [OPTIONS]"
+    echo
+    echo "Options:"
+    echo "  --list, -l           List available backups on server"
+    echo "  --download-all       Download all recent backups (last \$KEEP_LAST_N)"
+    echo "  --download NAME      Download specific backup by name"
+    echo "  --test               Test connection to server"
+    echo "  --path PATH          Set download path (default: \$DOWNLOAD_PATH)"
+    echo "  --keep-local N           Set number of local backups to keep (default: \$KEEP_LOCAL_BACKUPS)
+  --help, -h           Show this help message"
+    echo
+    echo "Configuration:"
+    echo "  Server: \$SERVER_USER@\$SERVER_IP"
+    echo "  Download path: \$DOWNLOAD_PATH"
+    echo "  Keep last: \$KEEP_LAST_N backups"
+    echo "  Keep locally: \$KEEP_LOCAL_BACKUPS backups"
+    echo
+    echo "Examples:"
+    echo "  \$0 --test                           # Test connection"
+    echo "  \$0 --list                           # List available backups"
+    echo "  \$0 --download-all                   # Download recent backups"
+    echo "  \$0 --download 20240706_020001       # Download specific backup"
+    echo "  \$0 --path /backup --download-all    # Download to custom path"
+    echo "  \$0 --keep-local 50 --download-all # Keep 50 local backups"
+}
+
+# Main function
+main() {
+    echo "========================================"
+    echo "  Remote Backup Download Tool"
+    echo "  Server: \$SERVER_USER@\$SERVER_IP"
+    echo "========================================"
+    echo
+
+    # Setup cleanup trap
+    trap cleanup EXIT
+
+    # Parse arguments
+    local action=""
+    local specific_backup=""
+
+    while [[ \$# -gt 0 ]]; do
+        case \$1 in
+            --list|-l)
+                action="list"
+                shift
+                ;;
+            --download-all)
+                action="download-all"
+                shift
+                ;;
+            --download)
+                action="download-specific"
+                specific_backup="\$2"
+                shift 2
+                ;;
+            --test)
+                action="test"
+                shift
+                ;;
+            --path)
+                DOWNLOAD_PATH="\$2"
+                shift 2
+                ;;
+            --keep-local)
+                KEEP_LOCAL_BACKUPS="\$2"
+                shift 2
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: \$1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Default action if none specified
+    if [ -z "\$action" ]; then
+        action="download-all"
+    fi
+
+    # Setup SSH key
+    TEMP_SSH_KEY=\$(setup_ssh_key)
+
+    # Execute action
+    case \$action in
+        test)
+            test_connection "\$TEMP_SSH_KEY"
+            ;;
+        list)
+            if test_connection "\$TEMP_SSH_KEY"; then
+                echo
+                log_info "Available backups:"
+                list_remote_backups "\$TEMP_SSH_KEY" | while read -r backup_path; do
+                    if [ -n "\$backup_path" ]; then
+                        backup_name=\$(basename "\$backup_path")
+                        backup_date=\$(date -d "\${backup_name:0:8}" "+%Y-%m-%d" 2>/dev/null || echo "Unknown")
+                        backup_time="\${backup_name:9:2}:\${backup_name:11:2}:\${backup_name:13:2}"
+                        echo "  📦 \$backup_name - \$backup_date \$backup_time"
+                    fi
+                done
+            fi
+            ;;
+        download-all)
+            if test_connection "\$TEMP_SSH_KEY"; then
+                echo
+                mkdir -p "\$DOWNLOAD_PATH"
+                log_info "Download path: \$DOWNLOAD_PATH"
+
+                local downloaded=0
+                list_remote_backups "\$TEMP_SSH_KEY" | head -n "\$KEEP_LAST_N" | while read -r backup_path; do
+                    if [ -n "\$backup_path" ]; then
+                        backup_name=\$(basename "\$backup_path")
+                        if download_backup "\$TEMP_SSH_KEY" "\$backup_path" "\$backup_name"; then
+                            downloaded=\$((downloaded + 1))
+                        fi
+                    fi
+                done
+
+                echo
+                log_success "Download completed"
+                log_info "Downloaded backups saved to: \$DOWNLOAD_PATH"
+
+                # Cleanup old backups
+                cleanup_old_backups
+            fi
+            ;;
+        download-specific)
+            if [ -z "\$specific_backup" ]; then
+                log_error "No backup name specified"
+                exit 1
+            fi
+
+            if test_connection "\$TEMP_SSH_KEY"; then
+                echo
+                mkdir -p "\$DOWNLOAD_PATH"
+                local remote_path="/root/backup/\$specific_backup"
+
+                # Check if backup exists
+                if ssh -i "\$TEMP_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "\$SERVER_USER@\$SERVER_IP" "[ -d \$remote_path ]" 2>/dev/null; then
+                    download_backup "\$TEMP_SSH_KEY" "\$remote_path" "\$specific_backup"
+                    echo
+                    log_success "Download completed"
+                    log_info "Backup saved to: \$DOWNLOAD_PATH/\$specific_backup"
+
+                    # Cleanup old backups
+                    cleanup_old_backups
+                else
+                    log_error "Backup not found: \$specific_backup"
+                    exit 1
+                fi
+            fi
+            ;;
+    esac
+}
+
+# Check if running as root (not recommended for client side)
+if [ "\$EUID" -eq 0 ]; then
+    log_warning "Running as root is not recommended for this script"
+    log_warning "Consider running as a regular user"
+fi
+
+# Run main function
+main "\$@"
+EOF
+
+    chmod +x "$download_script"
+    chown root:root "$download_script"
+
+    log_message "✓ Created remote download script: $download_script"
+    echo "✓ Created remote download script: $download_script"
+
+    # Create a user-friendly copy in /home/backup-reader for easy distribution
+    local user_script="$backup_user_home/download-backups.sh"
+    cp "$download_script" "$user_script"
+    chown "$backup_user:$backup_user" "$user_script"
+
+    log_message "✓ Created user copy: $user_script"
+    echo "✓ User copy available at: $user_script"
+
+    return 0
+}
 create_verification_report() {
     local report_file="/root/local-backup-system-verification.txt"
 
@@ -551,6 +1007,13 @@ $(crontab -l 2>/dev/null | grep -A 20 "$CRON_MARKER" 2>/dev/null | grep -E "(bac
 
 SCRIPT PERMISSIONS:
 $(find $SCRIPT_DIR -name "*.sh" -executable 2>/dev/null | wc -l) executable scripts found
+
+BACKUP USER:
+$(if id "backup-reader" >/dev/null 2>&1; then echo "✓ Created"; else echo "✗ Missing"; fi) - backup-reader user
+$(if [ -f "/home/backup-reader/.ssh/id_ed25519" ]; then echo "✓ Configured"; else echo "✗ Missing"; fi) - Ed25519 SSH key pair
+
+REMOTE ACCESS:
+$(if [ -f "/root/download-backups-from-server.sh" ]; then echo "✓ Available"; else echo "✗ Missing"; fi) - Download script
 
 ALIASES CONFIGURATION:
 $(if [ -f "/root/.bash_aliases" ]; then echo "✓ Created"; else echo "✗ Missing"; fi) - Bash aliases file
@@ -630,6 +1093,10 @@ main() {
 
     # Create monitoring script
     create_monitoring_script
+
+    # Create backup user and remote download script
+    create_backup_user
+    create_remote_download_script
 
     # Create helpful aliases (duplicate-safe)
     create_aliases
